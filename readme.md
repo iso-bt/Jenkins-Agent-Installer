@@ -14,6 +14,11 @@ Script şunları yapar:
 
 Verilmeyen her değer adım adım sorulur. Tüm değerler parametre olarak verilirse hiç soru sormadan çalışır.
 
+## Kılavuzlar
+
+- [Windows kurulum kılavuzu](docs/windows.md): parametreler, otomatik kurulum örnekleri, sertifika, güncelleme, kaldırma, sorun giderme
+- [Linux kurulum kılavuzu](docs/linux.md): parametreler, otomatik kurulum örnekleri, sertifika, güncelleme, kaldırma, sorun giderme
+
 ## Dosyalar
 
 | Dosya | Açıklama |
