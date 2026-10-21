@@ -112,7 +112,8 @@ function Get-AgentJarUrl([string] $Url) {
 
 function Test-AgentName([string] $Name) {
     # Gorev adi, dosya adi ve regex icinde kullanildigi icin sade karakterlerle sinirli.
-    return ($Name -match '^[A-Za-z0-9][A-Za-z0-9._-]*$')
+    # -cmatch: tr-TR kulturunde -match buyuk 'I' harfini [A-Za-z] ile eslestirmiyor.
+    return ($Name -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$')
 }
 
 function Test-IsUncPath([string] $Path) {

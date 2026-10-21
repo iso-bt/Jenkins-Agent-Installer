@@ -59,6 +59,10 @@ Assert-Throws 'bos url reddedilir'     { Get-NormalizedJenkinsUrl '' }
 Assert-True 'gecerli ad'          { Test-AgentName 'build-01.win_x64' }
 Assert-True 'bosluklu ad red'     { -not (Test-AgentName 'build 01') }
 Assert-True 'yol karakteri red'   { -not (Test-AgentName 'a\b') }
+$prevCulture = [Threading.Thread]::CurrentThread.CurrentCulture
+[Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'
+Assert-True 'tr-TR buyuk I'       { Test-AgentName 'X2IBSTSTAPPSERV' }
+[Threading.Thread]::CurrentThread.CurrentCulture = $prevCulture
 $pattern = Get-AgentNamePattern 'build-01'
 Assert-True 'ad eslesir'          { 'java -jar C:\a\agent.jar -url x -name build-01 -webSocket' -match $pattern }
 Assert-True 'satir sonunda eslesir' { 'java -jar agent.jar -name build-01' -match $pattern }
