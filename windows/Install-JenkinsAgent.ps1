@@ -542,7 +542,14 @@ function Save-AgentJar([string] $Url, [string] $Path, $Identity) {
         return
     }
     Write-Info "Indiriliyor: $Url"
-    Save-Download $Url $Path
+    try {
+        Save-Download $Url $Path
+    } catch [IO.IOException] {
+        # Farkli adla veya eski yontemle (-jnlpUrl) baslatilmis bir agent jar'i tutuyor olabilir.
+        $holders = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='java.exe'" |
+            Where-Object { $_.CommandLine -match 'agent\.jar' } | ForEach-Object { $_.ProcessId })
+        throw ("agent.jar kullanimda, guncellenemedi. agent.jar calistiran java surecleri: PID {0}. Bunlari durdurup (Stop-Process -Id <PID>) tekrar deneyin." -f ($holders -join ', '))
+    }
     Write-Ok 'agent.jar indirildi.'
 }
 
@@ -584,6 +591,12 @@ function Invoke-Install {
     Write-Step 5 'Java'
     $javaExe = Get-JavaExe -JavaRoot (Join-Path $installPath 'java') -Identity $identity
 
+    # Calisan agent agent.jar'i kilitler; eski gorev ve java jar guncellenmeden once durdurulur.
+    # Eski ayarlarla calisan java kalirsa wrapper yenisini de baslatmaz.
+    $taskName = Get-TaskName $name
+    Remove-AgentTask $taskName
+    Stop-AgentProcess $name
+
     Write-Step 6 'agent.jar'
     Save-AgentJar -Url (Get-AgentJarUrl $url) -Path (Join-Path $installPath 'agent.jar') -Identity $identity
 
@@ -603,10 +616,6 @@ function Invoke-Install {
     $wrapper = New-WrapperScript -AgentName $name -JenkinsUrl $url -JavaExe $javaExe -InstallDir $installPath -WorkDir $workPath
     New-LockedFile -Path $wrapperPath -Identity $identity -Rights 'ReadAndExecute'
     [IO.File]::WriteAllText($wrapperPath, $wrapper, (New-Object Text.UTF8Encoding($true)))
-    $taskName = Get-TaskName $name
-    Remove-AgentTask $taskName
-    # Eski ayarlarla calisan java kalirsa wrapper yenisini baslatmaz.
-    Stop-AgentProcess $name
     Register-AgentTask -TaskName $taskName -WrapperPath $wrapperPath -InstallDir $installPath -Account $account -Credential $credential
     Start-ScheduledTask -TaskName $taskName
     Show-TaskStatus -TaskName $taskName -Name $name
