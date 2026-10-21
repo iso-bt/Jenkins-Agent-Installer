@@ -185,6 +185,53 @@ last_pem_cert() {
     awk '/-BEGIN CERTIFICATE-/ { c = ""; on = 1 } on { c = c $0 "\n" } /-END CERTIFICATE-/ { on = 0; last = c } END { printf "%s", last }'
 }
 
+# stdin'deki PEM zincirinden ilk (sitenin kendi) sertifikasini basar.
+first_pem_cert() {
+    awk '/-BEGIN CERTIFICATE-/ { on = 1 } on { print } /-END CERTIFICATE-/ { exit }'
+}
+
+is_ip() { [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; }
+verify_host_opt() { if is_ip "$1"; then echo -verify_ip; else echo -verify_hostname; fi; }
+
+# "May 29 10:43:45 2125 GMT" gibi bir tarih gelecekteyse basarili doner.
+date_in_future() { [ "$(date -d "$1" +%s)" -gt "$(date +%s)" ]; }
+
+# cert_problem SITE_PEM PIN_PEM HOST: sabitlemenin cozemeyecegi sorunu basar; sorun yoksa 1 doner.
+cert_problem() {
+    local leaf=$1 pin=$2 host=$3 c check=-checkhost
+    is_ip "$host" && check=-checkip
+    # Uyusmazlikta openssl 1 ile cikar (surume gore degisir), bu yuzden cikti kontrol edilir.
+    if [[ "$(openssl x509 -noout "$check" "$host" -in "$leaf" 2>&1)" == *"NOT match"* ]]; then
+        echo "Sertifika bu adres ($host) icin verilmemis."
+        return 0
+    fi
+    for c in "$leaf" "$pin"; do
+        if ! openssl x509 -noout -checkend 0 -in "$c" >/dev/null; then
+            echo "Sertifikanin suresi dolmus: $(cert_name subject "$c")"
+            return 0
+        fi
+        if date_in_future "$(openssl x509 -noout -startdate -in "$c" | cut -d= -f2)"; then
+            echo "Sertifika henuz gecerli degil: $(cert_name subject "$c")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# in_cert_dir PEM [DIZIN...]: sertifika (parmak iziyle) hash dizinli bir sistem deposunda var mi?
+in_cert_dir() {
+    local fp dir f hash
+    fp=$(cert_sha256 "$1")
+    hash=$(openssl x509 -noout -subject_hash -in "$1")
+    shift
+    for dir in "${@:-/etc/ssl/certs}"; do
+        for f in "$dir/$hash".[0-9]; do
+            [ -f "$f" ] && [ "$(cert_sha256 "$f")" = "$fp" ] && return 0
+        done
+    done
+    return 1
+}
+
 cert_name() { openssl x509 -noout "-$1" -nameopt RFC2253 -in "$2" | sed "s/^$1= *//"; }
 cert_sha256() { normalize_sha256 "$(openssl x509 -noout -fingerprint -sha256 -in "$1")"; }
 is_self_signed() { [ "$(cert_name subject "$1")" = "$(cert_name issuer "$1")" ]; }
@@ -311,7 +358,13 @@ check_tls() {
     curl -sS -o /dev/null --max-time 20 "$JENKINS_URL" 2>"$err" || rc=$?
     case "$rc" in
         0) TLS_MODE=system; info "Sertifika sistem sertifika deposuna gore gecerli." ;;
-        35 | 51 | 58 | 60 | 77 | 83) TLS_MODE=untrusted; info "Sertifika bu makinede dogrulanamadi: $(head -n1 "$err")" ;;
+        35 | 51 | 58 | 60 | 77 | 83)
+            TLS_MODE=untrusted
+            info "Sertifika bu makinede dogrulanamadi: $(head -n1 "$err")"
+            if [ -n "${https_proxy:-}${HTTPS_PROXY:-}" ]; then
+                info "UYARI: Proxy tanimli (https_proxy). openssl ve Java bu proxy'yi kullanmaz; proxy TLS'e araya giriyorsa burada gorulen sertifika agent'in gorecegi sertifikadan farkli olabilir."
+            fi
+            ;;
         6) die "Jenkins adresi cozulemedi (DNS): $(head -n1 "$err")" ;;
         7) die "Jenkins'e baglanilamadi (ag, port veya firewall): $(head -n1 "$err")" ;;
         28) die "Jenkins'e baglanti zaman asimina ugradi: $(head -n1 "$err")" ;;
@@ -361,6 +414,9 @@ choose_pin() {
         [ "$TRUSTED_SHA256" = "$fp" ] || die "Sertifika parmak izi --trusted-cert-sha256 ile eslesmiyor (sunucu: $fp)."
         info "Parmak izi --trusted-cert-sha256 ile eslesti."
     else
+        if in_cert_dir "$PIN_PEM" /etc/ssl/certs /etc/pki/ca-trust/extracted/pem/directory-hash; then
+            info "NOT: Bu sertifika sistem deposunda zaten olan genel bir kok CA. Sabitlenirse agent bu CA'nin imzaladigi her sunucuya guvenir."
+        fi
         confirm_strict "Bu sertifika sabitlensin mi? Parmak izini Jenkins yoneticisinden dogrulayin." n || die "Iptal edildi."
     fi
     TLS_MODE=pinned
@@ -371,7 +427,7 @@ choose_pin() {
 pin_system_trusted() {
     local host port issuer f
     read -r host port <<<"$(url_host_port "$JENKINS_URL")"
-    fetch_top_cert "$PIN_PEM" -verify_return_error -verify_hostname "$host" || die "Sertifika zinciri alinamadi veya dogrulanamadi."
+    fetch_top_cert "$PIN_PEM" -verify_return_error "$(verify_host_opt "$host")" "$host" || die "Sertifika zinciri alinamadi veya dogrulanamadi."
     issuer=$(cert_name issuer "$PIN_PEM")
     for f in /etc/ssl/certs/"$(openssl x509 -noout -issuer_hash -in "$PIN_PEM")".[0-9]; do
         if [ -f "$f" ] && [ "$(cert_name subject "$f")" = "$issuer" ]; then
@@ -383,7 +439,7 @@ pin_system_trusted() {
 }
 
 choose_tls() {
-    local store="$INSTALL_DIR/truststore.p12" mode=""
+    local store="$INSTALL_DIR/truststore.p12" mode="" problem
     PIN_PEM="$TMP_DIR/jenkins-ca.pem"
     case "$TLS_MODE" in
         "") info "http adresi, sertifika ayari gerekmiyor."; return ;;
@@ -401,6 +457,19 @@ choose_tls() {
     esac
     command -v openssl >/dev/null 2>&1 || die "openssl gerekli."
     fetch_top_cert "$PIN_PEM" || die "Sertifika zinciri alinamadi."
+    first_pem_cert <"$TMP_DIR/chain.txt" >"$TMP_DIR/site.pem"
+    if problem=$(cert_problem "$TMP_DIR/site.pem" "$PIN_PEM" "$(url_host_port "$JENKINS_URL" | cut -d' ' -f1)"); then
+        show_cert "$PIN_PEM"
+        info "Sabitleme sunulmuyor, sabitleme bu sorunu cozmez: $problem"
+        [ -n "$TRUSTED_SHA256" ] && die "$problem"
+        if [ "$SKIP_CERT_CHECK" -eq 1 ]; then choose_bypass; return; fi
+        [ "$NON_INTERACTIVE" -eq 1 ] && die "$problem Sertifikayi duzeltin veya --skip-certificate-check verin."
+        info "1) Sertifika kontrolunu kapat (guvensiz)"
+        info "2) Iptal"
+        ask mode "Secim" "2"
+        [ "$mode" = "1" ] && { choose_bypass; return; }
+        die "Iptal edildi."
+    fi
     if [ "$SKIP_CERT_CHECK" -ne 1 ] && [ -z "$TRUSTED_SHA256" ] && [ -f "$store" ] &&
         [ "$(truststore_sha256 "$store")" = "$(cert_sha256 "$PIN_PEM")" ]; then
         info "Mevcut truststore ayni sertifikayi iceriyor, kullaniliyor: $store"
@@ -633,6 +702,10 @@ self_test() {
     check "sha256 hex disi red" '! normalize_sha256 "${hex%?}g" >/dev/null'
     check "host varsayilan port" '[ "$(url_host_port "https://jenkins.example.com/")" = "jenkins.example.com 443" ]'
     check "host port yol" '[ "$(url_host_port "https://ci.example.com:8443/jenkins/")" = "ci.example.com 8443" ]'
+    check "ipv4" 'is_ip 10.1.2.3 && ! is_ip jenkins.example.com'
+    check "verify_ip" '[ "$(verify_host_opt 10.1.2.3)" = -verify_ip ] && [ "$(verify_host_opt jenkins.example.com)" = -verify_hostname ]'
+    check "tarih gelecekte" 'date_in_future "Jan  1 00:00:00 2999 GMT" && ! date_in_future "Jan  1 00:00:00 2000 GMT"'
+    check "iki flag birlikte red" '! (parse_args --trusted-cert-sha256 "$hex" --skip-certificate-check) 2>/dev/null'
     check "pem en ust" '[ "$(printf "x\n-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\ny\n-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\nz\n" | last_pem_cert | sed -n 2p)" = B ]'
 
     TMP_DIR=$dir INSTALL_DIR="/opt/ja dir" JAVA_BIN=/usr/bin/java AGENT_NAME=a1 AGENT_USER=jenkins WORK_DIR=/w JENKINS_URL=https://j/
@@ -657,6 +730,21 @@ self_test() {
         check "site sertifikasi kok degil" '! is_self_signed "$dir/leaf.pem"'
         check "parmak izi" '[ "$(cert_sha256 "$dir/ca.pem")" = "$(normalize_sha256 "$(openssl x509 -noout -fingerprint -sha256 -in "$dir/ca.pem")")" ] && [ "$(cert_sha256 "$dir/ca.pem")" != "$(cert_sha256 "$dir/leaf.pem")" ]'
         check "zincirden en ust" '[ "$(cat "$dir/leaf.pem" "$dir/ca.pem" | last_pem_cert | openssl x509 -noout -subject -nameopt RFC2253)" = "subject=CN=Test CA" ]'
+        check "zincirden site" '[ "$(cat "$dir/leaf.pem" "$dir/ca.pem" | first_pem_cert | openssl x509 -noout -subject -nameopt RFC2253)" = "subject=CN=jenkins.example.com" ]'
+        check "sorun yok" '! cert_problem "$dir/leaf.pem" "$dir/ca.pem" jenkins.example.com >/dev/null'
+        check "ad uyusmuyor" 'cert_problem "$dir/leaf.pem" "$dir/ca.pem" other.example.com | grep -q "adres (other.example.com)"'
+        check "ip uyusmuyor" 'cert_problem "$dir/leaf.pem" "$dir/ca.pem" 10.0.0.1 | grep -q "adres (10.0.0.1)"'
+        mkdir -p "$dir/certs"
+        cp "$dir/ca.pem" "$dir/certs/$(openssl x509 -noout -subject_hash -in "$dir/ca.pem").0"
+        check "sistem deposunda" 'in_cert_dir "$dir/ca.pem" "$dir/yok" "$dir/certs"'
+        check "sistem deposunda degil" '! in_cert_dir "$dir/leaf.pem" "$dir/certs"'
+        if openssl req -help 2>&1 | grep -q not_after; then
+            openssl req -x509 -newkey rsa:2048 -nodes -subj "/CN=jenkins.example.com" -not_before 20000101000000Z \
+                -not_after 20010101000000Z -keyout "$dir/old.key" -out "$dir/old.pem" >/dev/null 2>&1
+            check "suresi dolmus" 'cert_problem "$dir/old.pem" "$dir/old.pem" jenkins.example.com | grep -q "suresi dolmus"'
+        else
+            echo "SKIP  openssl -not_after yok, suresi dolmus testi atlandi"
+        fi
     else
         echo "SKIP  openssl yok, sertifika testleri atlandi"
     fi
@@ -690,6 +778,10 @@ parse_args() {
         esac
     done
     [[ "$JAVA_VERSION" =~ ^[0-9]+$ ]] || die "Gecersiz --java-version: $JAVA_VERSION"
+    if [ -n "$TRUSTED_SHA256" ] && [ "$SKIP_CERT_CHECK" -eq 1 ]; then
+        die "--trusted-cert-sha256 ve --skip-certificate-check birlikte verilemez."
+    fi
+    return 0
 }
 
 main() {

@@ -45,8 +45,11 @@ sunucu sertifikasını makinedeki sertifika deposuna göre kontrol eder.
 Güvenilmeyen sertifikada önce konu, yayıncı, geçerlilik tarihleri ve SHA-256 parmak izi gösterilir, sonra menü çıkar:
 
 1. **Sertifikayı sabitle (önerilen):** Onaylanırsa sertifika kurulum klasöründeki `truststore.p12` dosyasına
-   `jenkins-ca` takma adıyla yazılır. Sistem sertifika deposuna dokunulmaz. Windows'ta adres ile sertifikadaki ad
-   eşleşmiyorsa, ya da zincir süresi geçmiş veya hatalıysa bu seçenek sunulmaz.
+   `jenkins-ca` takma adıyla yazılır. Sistem sertifika deposuna dokunulmaz. Adres ile sertifikadaki ad
+   eşleşmiyorsa ya da zincir süresi geçmiş, henüz geçerli değil veya hatalıysa bu seçenek sunulmaz (sabitleme
+   bunu çözmez); nedeni gösterilir ve sadece kontrolü kapatma ve iptal kalır. Linux'ta bu durumda menünün
+   varsayılanı iptaldir. Sabitlenecek sertifika sistem deposunda zaten olan genel bir kök CA ise Linux onay
+   sorusundan önce bunu belirtir.
 2. **Sertifika kontrolünü kapat (güvensiz):** Uyarı gösterilir ve ayrıca onay istenir. Agent
    `-noCertificateCheck` ile başlatılır; her başlatmada log'a WARN yazılır.
 3. **İptal:** Kurulum durur.
@@ -54,9 +57,11 @@ Güvenilmeyen sertifikada önce konu, yayıncı, geçerlilik tarihleri ve SHA-25
 Sertifika sorularında `-Force` (Windows) ve `-y` (Linux) evet demez. Soru sorulmadan karar vermek için:
 
 - Parmak izini bilip sabitlemek: Windows `-TrustedCertThumbprint <sha256>`, Linux `--trusted-cert-sha256 <hex>`.
-  Parmak izi eşleşirse sormadan sabitlenir, eşleşmezse kurulum durur.
+  Parmak izi eşleşirse sormadan sabitlenir, eşleşmezse ya da sertifika yukarıdaki nedenlerle sabitlenemiyorsa
+  kurulum durur.
 - Kontrolü sormadan kapatmak: Windows `-SkipCertificateCheck`, Linux `--skip-certificate-check`.
   Uyarı yine yazılır, onay sorulmaz.
+- Linux'ta `--trusted-cert-sha256` ve `--skip-certificate-check` birlikte verilirse kurulum hata verip durur.
 - Sistemce güvenilen sertifikada bu seçenekler yok sayılır.
 
 Parmak izi menüdeki "SHA-256" satırında görünür; değerini Jenkins yöneticisinden doğrulayın.
@@ -84,7 +89,8 @@ Güvenlik ve proxy:
   Kontrolü kapatmak son çaredir.
 - Java sistem proxy'sini kullanmaz. Araya TLS inceleyen bir proxy varsa script'in gördüğü sertifika ile agent'in
   göreceği sertifika farklı olabilir ve sabitlenen sertifika eşleşmeyebilir. Linux'ta sertifika `openssl s_client`
-  ile doğrudan alınır; bu araç proxy ortam değişkenlerini kullanmaz.
+  ile doğrudan alınır; bu araç proxy ortam değişkenlerini kullanmaz. Proxy tanımlıysa (Windows: sistem proxy'si,
+  Linux: `https_proxy`/`HTTPS_PROXY`) ve sertifika doğrulanamıyorsa script bu konuda uyarı verir.
 
 ## Windows
 
