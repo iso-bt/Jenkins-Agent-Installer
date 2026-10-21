@@ -11,7 +11,9 @@ set -euo pipefail
 
 SCRIPT_URL="https://raw.githubusercontent.com/iso-bt/Jenkins-Agent-Installer/master/linux/install-jenkins-agent.sh"
 MIN_JAVA_MAJOR=17
-TOTAL_STEPS=8
+TOTAL_STEPS=9
+# Truststore parolasi gizli degildir; PKCS12 icin bir deger gerekir (Java/keytool varsayilani).
+TRUSTSTORE_PASS="changeit"
 
 JENKINS_URL=""
 AGENT_NAME=""
@@ -28,6 +30,12 @@ SECRET_DIR="/etc/jenkins-agent"
 TMP_DIR=""
 JAVA_BIN=""
 SECRET=""
+TRUSTED_SHA256=""
+SKIP_CERT_CHECK=0
+TLS_MODE=""           # "" (http), system, untrusted (gecici), pinned, bypass
+JAVA_TRUSTSTORE=""    # system modunda kullanilan sistem Java truststore'u
+PIN_PEM=""            # pinned modunda sabitlenen sertifika (agent.jar indirmesi icin)
+TRUSTSTORE_REUSED=0
 
 usage() {
     cat <<'EOF'
@@ -41,6 +49,11 @@ Kullanim: install-jenkins-agent.sh [secenekler]
   --user KULLANICI     Agent'in calisacagi kullanici (varsayilan: jenkins)
   --java-home DIZIN    Mevcut Java (JAVA_HOME, bin dizini veya java yolu)
   --java-version N     Indirilecek Temurin surumu (varsayilan: 25)
+  --trusted-cert-sha256 HEX
+                       Sistemin guvenmedigi sertifikayi, SHA-256 parmak izi bununla
+                       eslesirse sabitle (truststore.p12)
+  --skip-certificate-check
+                       Sertifika kontrolunu kapat (guvensiz, son care)
   --non-interactive    Soru sorma, verilmeyenler icin varsayilanlari kullan
   -y, --yes            Onay sorularina evet de
   --uninstall          Servisi ve secret dosyasini kaldir
@@ -137,13 +150,67 @@ confirm() {
 }
 
 download() {
+    # download URL DOSYA [ek curl argumanlari...]  (https icin curl zorunlu, bkz. check_tls)
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$2" "$1"
+        curl -fsSL --retry 3 "${@:3}" -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
         wget -q -O "$2" "$1"
     else
         die "curl veya wget gerekli."
     fi
+}
+
+# "SHA256 Fingerprint=AB:CD:.." / "ab cd .." / "abcd.." -> 64 haneli kucuk harf hex
+normalize_sha256() {
+    local hex
+    hex=$(printf '%s' "${1##*=}" | tr -d ': \t\r\n' | tr 'A-F' 'a-f')
+    [[ "$hex" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$hex"
+}
+
+# https://host:port/yol -> "host port"
+# shortcut: IPv6 adres ([::1]) desteklenmez; gerekirse host adi kullanin.
+url_host_port() {
+    local hp=${1#*://}
+    hp=${hp%%/*}
+    hp=${hp##*@}
+    case "$hp" in
+        *:*) printf '%s %s\n' "${hp%:*}" "${hp##*:}" ;;
+        *) printf '%s 443\n' "$hp" ;;
+    esac
+}
+
+# stdin'deki PEM zincirinden son (en ust) sertifikayi basar.
+last_pem_cert() {
+    awk '/-BEGIN CERTIFICATE-/ { c = ""; on = 1 } on { c = c $0 "\n" } /-END CERTIFICATE-/ { on = 0; last = c } END { printf "%s", last }'
+}
+
+cert_name() { openssl x509 -noout "-$1" -nameopt RFC2253 -in "$2" | sed "s/^$1= *//"; }
+cert_sha256() { normalize_sha256 "$(openssl x509 -noout -fingerprint -sha256 -in "$1")"; }
+is_self_signed() { [ "$(cert_name subject "$1")" = "$(cert_name issuer "$1")" ]; }
+
+# Truststore'daki (tek) sertifikanin parmak izi; okunamazsa bos doner.
+truststore_sha256() {
+    openssl pkcs12 -in "$1" -nokeys -passin "pass:$TRUSTSTORE_PASS" 2>/dev/null >"$TMP_DIR/store.pem" || return 1
+    cert_sha256 "$TMP_DIR/store.pem" 2>/dev/null
+}
+
+system_java_truststore() {
+    local f
+    for f in /etc/ssl/certs/java/cacerts /etc/pki/ca-trust/extracted/java/cacerts; do
+        [ -s "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# systemd ExecStart icin -jar oncesi Java argumanlari.
+# Sistem Java deposu (Debian/RHEL) changeit ile yazilir; parola olmadan PKCS12 sertifikalari okunamaz.
+tls_java_opts() {
+    case "$TLS_MODE" in
+        system) printf '"-Djavax.net.ssl.trustStore=%s" -Djavax.net.ssl.trustStorePassword=%s ' "$JAVA_TRUSTSTORE" "$TRUSTSTORE_PASS" ;;
+        pinned) printf '"-Djavax.net.ssl.trustStore=%s" -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=%s ' "$INSTALL_DIR/truststore.p12" "$TRUSTSTORE_PASS" ;;
+    esac
+    return 0
 }
 
 ensure_root() {
@@ -236,6 +303,148 @@ choose_java() {
     done
 }
 
+# Jenkins adresine sistem sertifika deposuyla (curl, -k olmadan) baglanir.
+check_tls() {
+    local rc=0 err="$TMP_DIR/curl.err"
+    case "$JENKINS_URL" in https://*) ;; *) TLS_MODE=""; return ;; esac
+    command -v curl >/dev/null 2>&1 || die "https adresi icin curl gerekli."
+    curl -sS -o /dev/null --max-time 20 "$JENKINS_URL" 2>"$err" || rc=$?
+    case "$rc" in
+        0) TLS_MODE=system; info "Sertifika sistem sertifika deposuna gore gecerli." ;;
+        35 | 51 | 58 | 60 | 77 | 83) TLS_MODE=untrusted; info "Sertifika bu makinede dogrulanamadi: $(head -n1 "$err")" ;;
+        6) die "Jenkins adresi cozulemedi (DNS): $(head -n1 "$err")" ;;
+        7) die "Jenkins'e baglanilamadi (ag, port veya firewall): $(head -n1 "$err")" ;;
+        28) die "Jenkins'e baglanti zaman asimina ugradi: $(head -n1 "$err")" ;;
+        *) die "Jenkins'e erisilemedi (curl kodu $rc): $(head -n1 "$err")" ;;
+    esac
+}
+
+# fetch_top_cert CIKTI [openssl s_client ek argumanlari...]
+# Zinciri sadece incelemek icin alir, en ustteki sertifikayi CIKTI'ya yazar.
+fetch_top_cert() {
+    local out=$1 host port
+    shift
+    read -r host port <<<"$(url_host_port "$JENKINS_URL")"
+    timeout 20 openssl s_client -connect "$host:$port" -servername "$host" -showcerts "$@" \
+        </dev/null >"$TMP_DIR/chain.txt" 2>/dev/null || return 1
+    last_pem_cert <"$TMP_DIR/chain.txt" >"$out"
+    [ -s "$out" ]
+}
+
+show_cert() {
+    info "Konu      : $(cert_name subject "$1")"
+    info "Yayinci   : $(cert_name issuer "$1")"
+    info "Gecerlilik: $(openssl x509 -noout -startdate -in "$1" | cut -d= -f2) - $(openssl x509 -noout -enddate -in "$1" | cut -d= -f2)"
+    info "SHA-256   : $(cert_sha256 "$1")"
+    is_self_signed "$1" || info "UYARI: Bu sertifika kok CA degil (sitenin kendi sertifikasi veya ara CA). Sertifika yenilendiginde bu script yeniden calistirilmali."
+}
+
+# -y/--yes guvenlik onaylarini gecmez (confirm global ASSUME_YES'i okur).
+confirm_strict() {
+    local ASSUME_YES=0
+    confirm "$@"
+}
+
+choose_bypass() {
+    info "UYARI: Sertifika kontrolu kapatilirsa agi dinleyebilen biri kendini Jenkins gibi"
+    info "gosterip agent secret'ini calabilir ve bu makineye istedigi isi gonderebilir."
+    if [ "$SKIP_CERT_CHECK" -ne 1 ]; then
+        confirm_strict "Yine de sertifika kontrolu kapatilsin mi?" n || die "Iptal edildi."
+    fi
+    TLS_MODE=bypass
+}
+
+choose_pin() {
+    local fp
+    fp=$(cert_sha256 "$PIN_PEM") || die "Sertifika parmak izi okunamadi."
+    if [ -n "$TRUSTED_SHA256" ]; then
+        [ "$TRUSTED_SHA256" = "$fp" ] || die "Sertifika parmak izi --trusted-cert-sha256 ile eslesmiyor (sunucu: $fp)."
+        info "Parmak izi --trusted-cert-sha256 ile eslesti."
+    else
+        confirm_strict "Bu sertifika sabitlensin mi? Parmak izini Jenkins yoneticisinden dogrulayin." n || die "Iptal edildi."
+    fi
+    TLS_MODE=pinned
+}
+
+# Sistem guveniyor ama Java icin sistem deposu yok: zinciri ayni dogrulamayla (sistem deposu +
+# host adi) alir, imzalayan CA /etc/ssl/certs icindeyse onu, yoksa en ustteki sertifikayi sabitler.
+pin_system_trusted() {
+    local host port issuer f
+    read -r host port <<<"$(url_host_port "$JENKINS_URL")"
+    fetch_top_cert "$PIN_PEM" -verify_return_error -verify_hostname "$host" || die "Sertifika zinciri alinamadi veya dogrulanamadi."
+    issuer=$(cert_name issuer "$PIN_PEM")
+    for f in /etc/ssl/certs/"$(openssl x509 -noout -issuer_hash -in "$PIN_PEM")".[0-9]; do
+        if [ -f "$f" ] && [ "$(cert_name subject "$f")" = "$issuer" ]; then
+            cp "$f" "$PIN_PEM"
+            break
+        fi
+    done
+    TLS_MODE=pinned
+}
+
+choose_tls() {
+    local store="$INSTALL_DIR/truststore.p12" mode=""
+    PIN_PEM="$TMP_DIR/jenkins-ca.pem"
+    case "$TLS_MODE" in
+        "") info "http adresi, sertifika ayari gerekmiyor."; return ;;
+        system)
+            if JAVA_TRUSTSTORE=$(system_java_truststore); then
+                info "Java sistem sertifika deposunu kullanacak: $JAVA_TRUSTSTORE"
+                return
+            fi
+            command -v openssl >/dev/null 2>&1 || die "openssl gerekli."
+            info "Java icin sistem deposu yok (Debian/Ubuntu: ca-certificates-java), sertifika sabitlenecek."
+            pin_system_trusted
+            show_cert "$PIN_PEM"
+            return
+            ;;
+    esac
+    command -v openssl >/dev/null 2>&1 || die "openssl gerekli."
+    fetch_top_cert "$PIN_PEM" || die "Sertifika zinciri alinamadi."
+    if [ "$SKIP_CERT_CHECK" -ne 1 ] && [ -z "$TRUSTED_SHA256" ] && [ -f "$store" ] &&
+        [ "$(truststore_sha256 "$store")" = "$(cert_sha256 "$PIN_PEM")" ]; then
+        info "Mevcut truststore ayni sertifikayi iceriyor, kullaniliyor: $store"
+        TLS_MODE=pinned
+        TRUSTSTORE_REUSED=1
+        return
+    fi
+    show_cert "$PIN_PEM"
+    if [ "$SKIP_CERT_CHECK" -eq 1 ]; then choose_bypass; return; fi
+    if [ -n "$TRUSTED_SHA256" ]; then choose_pin; return; fi
+    [ "$NON_INTERACTIVE" -eq 1 ] && die "Sertifikaya guvenilmiyor. --trusted-cert-sha256 veya --skip-certificate-check verin."
+    info "1) Sertifikayi sabitle (onerilen)"
+    info "2) Sertifika kontrolunu kapat (guvensiz)"
+    info "3) Iptal"
+    ask mode "Secim" "1"
+    case "$mode" in
+        1) choose_pin ;;
+        2) choose_bypass ;;
+        *) die "Iptal edildi." ;;
+    esac
+}
+
+# Secilen moda gore truststore.p12'yi yazar veya eski kalani siler.
+write_truststore() {
+    local store="$INSTALL_DIR/truststore.p12" keytool
+    if [ "$TLS_MODE" != pinned ]; then
+        rm -f "$store"
+        return
+    fi
+    if [ "$TRUSTSTORE_REUSED" -eq 0 ]; then
+        keytool="$(dirname "$JAVA_BIN")/keytool"
+        [ -x "$keytool" ] || keytool="$(dirname "$(readlink -f "$JAVA_BIN")")/keytool"
+        [ -x "$keytool" ] || die "keytool bulunamadi: $keytool"
+        rm -f "$TMP_DIR/truststore.p12"
+        "$keytool" -importcert -noprompt -alias jenkins-ca -file "$PIN_PEM" -keystore "$TMP_DIR/truststore.p12" \
+            -storetype PKCS12 -storepass "$TRUSTSTORE_PASS" >"$TMP_DIR/keytool.log" 2>&1 ||
+            die "truststore olusturulamadi: $(<"$TMP_DIR/keytool.log")"
+        install -m 600 "$TMP_DIR/truststore.p12" "$store"
+        info "Truststore yazildi: $store"
+    fi
+    chown "$AGENT_USER:" "$store"
+    chmod 600 "$store"
+}
+
 ensure_user() {
     if id "$AGENT_USER" >/dev/null 2>&1; then
         info "Kullanici mevcut: $AGENT_USER"
@@ -282,9 +491,13 @@ write_secret() {
 }
 
 write_unit() {
-    local unit_file=$1 secret_file=$2 url
+    local unit_file=$1 secret_file=$2 url pre="" agent_opts=""
     # systemd % karakterini ozel yorumlar.
     url=${JENKINS_URL//%/%%}
+    if [ "$TLS_MODE" = bypass ]; then
+        pre='ExecStartPre=/bin/echo "WARN sertifika kontrolu kapali (-noCertificateCheck), baglanti dinlenebilir."'
+        agent_opts=" -noCertificateCheck"
+    fi
     cat >"$unit_file" <<EOF
 [Unit]
 Description=Jenkins inbound agent ($AGENT_NAME)
@@ -295,7 +508,8 @@ After=network-online.target
 Type=simple
 User=$AGENT_USER
 WorkingDirectory=$WORK_DIR
-ExecStart="$JAVA_BIN" -jar "$INSTALL_DIR/agent.jar" -url "$url" -name "$AGENT_NAME" -secret "@$secret_file" -webSocket -workDir "$WORK_DIR"
+$pre
+ExecStart="$JAVA_BIN" $(tls_java_opts)-jar "$INSTALL_DIR/agent.jar" -url "$url" -name "$AGENT_NAME" -secret "@$secret_file" -webSocket -workDir "$WORK_DIR"$agent_opts
 Restart=always
 RestartSec=10
 
@@ -311,6 +525,7 @@ do_install() {
     raw_url=$JENKINS_URL
     [ -n "$raw_url" ] || ask_required raw_url "Jenkins URL (ornek: https://jenkins.example.com/)"
     JENKINS_URL=$(normalize_url "$raw_url") || die "Gecersiz Jenkins URL: $raw_url (http:// veya https:// ile baslamali)."
+    check_tls
 
     step 2 "Agent adi"
     [ -n "$AGENT_NAME" ] || ask_required AGENT_NAME "Agent (node) adi" "$(hostname -s 2>/dev/null || hostname)"
@@ -320,7 +535,10 @@ do_install() {
     [ -n "$INSTALL_DIR" ] || ask_required INSTALL_DIR "Kurulum dizini" "/opt/jenkins-agent"
     [ -n "$WORK_DIR" ] || ask_required WORK_DIR "Calisma dizini (workDir)" "/var/lib/jenkins-agent"
 
-    step 4 "Kullanici"
+    step 4 "Sertifika"
+    choose_tls
+
+    step 5 "Kullanici"
     [ -n "$AGENT_USER" ] || ask_required AGENT_USER "Agent'in calisacagi kullanici" "jenkins"
     ensure_user
     mkdir -p "$INSTALL_DIR" "$WORK_DIR"
@@ -328,25 +546,30 @@ do_install() {
     chown "$AGENT_USER:" "$WORK_DIR"
     chmod 750 "$WORK_DIR"
 
-    step 5 "Java"
+    step 6 "Java"
     choose_java
+    write_truststore
 
-    step 6 "agent.jar"
+    step 7 "agent.jar"
     jar="$INSTALL_DIR/agent.jar"
     if [ ! -f "$jar" ] || confirm "agent.jar zaten var, guncellensin mi?" y; then
         info "Indiriliyor: ${JENKINS_URL}jnlpJars/agent.jar"
-        download "${JENKINS_URL}jnlpJars/agent.jar" "$TMP_DIR/agent.jar"
+        case "$TLS_MODE" in
+            pinned) download "${JENKINS_URL}jnlpJars/agent.jar" "$TMP_DIR/agent.jar" --cacert "$PIN_PEM" ;;
+            bypass) download "${JENKINS_URL}jnlpJars/agent.jar" "$TMP_DIR/agent.jar" -k ;;
+            *) download "${JENKINS_URL}jnlpJars/agent.jar" "$TMP_DIR/agent.jar" ;;
+        esac
         install -m 644 "$TMP_DIR/agent.jar" "$jar"
     fi
 
-    step 7 "Secret"
+    step 8 "Secret"
     secret_file="$SECRET_DIR/$AGENT_NAME.secret"
     read_secret "$secret_file"
     write_secret "$secret_file"
     SECRET=""
     info "Secret dosyasi: $secret_file"
 
-    step 8 "systemd servisi"
+    step 9 "systemd servisi"
     service="jenkins-agent-$AGENT_NAME.service"
     unit="/etc/systemd/system/$service"
     write_unit "$unit" "$secret_file"
@@ -402,6 +625,41 @@ self_test() {
     check "java bin" '[ "$(resolve_java "$dir/jdk/bin")" = "$dir/jdk/bin/java" ]'
     check "java yolu" '[ "$(resolve_java "$dir/jdk/bin/java")" = "$dir/jdk/bin/java" ]'
     check "java yok" '! resolve_java "$dir/yok" >/dev/null'
+
+    local hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    check "sha256 iki nokta/buyuk" '[ "$(normalize_sha256 "SHA256 Fingerprint=01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF")" = "$hex" ]'
+    check "sha256 bosluklu" '[ "$(normalize_sha256 "01 23 45 67 89 ab cd ef 0123456789abcdef0123456789abcdef0123456789abcdef")" = "$hex" ]'
+    check "sha256 kisa red" '! normalize_sha256 abcd >/dev/null'
+    check "sha256 hex disi red" '! normalize_sha256 "${hex%?}g" >/dev/null'
+    check "host varsayilan port" '[ "$(url_host_port "https://jenkins.example.com/")" = "jenkins.example.com 443" ]'
+    check "host port yol" '[ "$(url_host_port "https://ci.example.com:8443/jenkins/")" = "ci.example.com 8443" ]'
+    check "pem en ust" '[ "$(printf "x\n-----BEGIN CERTIFICATE-----\nA\n-----END CERTIFICATE-----\ny\n-----BEGIN CERTIFICATE-----\nB\n-----END CERTIFICATE-----\nz\n" | last_pem_cert | sed -n 2p)" = B ]'
+
+    TMP_DIR=$dir INSTALL_DIR="/opt/ja dir" JAVA_BIN=/usr/bin/java AGENT_NAME=a1 AGENT_USER=jenkins WORK_DIR=/w JENKINS_URL=https://j/
+    JAVA_TRUSTSTORE=/etc/ssl/certs/java/cacerts TLS_MODE=system
+    check "opts system" '[ "$(tls_java_opts)" = "\"-Djavax.net.ssl.trustStore=/etc/ssl/certs/java/cacerts\" -Djavax.net.ssl.trustStorePassword=changeit " ]'
+    TLS_MODE=pinned
+    check "opts pinned" '[ "$(tls_java_opts)" = "\"-Djavax.net.ssl.trustStore=/opt/ja dir/truststore.p12\" -Djavax.net.ssl.trustStoreType=PKCS12 -Djavax.net.ssl.trustStorePassword=changeit " ]'
+    write_unit "$dir/unit" /s
+    check "unit pinned" 'grep -q "^ExecStart=\"/usr/bin/java\" \"-Djavax.net.ssl.trustStore=/opt/ja dir/truststore.p12\" .* -jar \"/opt/ja dir/agent.jar\" .*-webSocket -workDir \"/w\"$" "$dir/unit" && ! grep -q "noCertificateCheck\|ExecStartPre" "$dir/unit"'
+    TLS_MODE=bypass
+    check "opts bypass" '[ -z "$(tls_java_opts)" ]'
+    write_unit "$dir/unit" /s
+    check "unit bypass" 'grep -q "^ExecStart=\"/usr/bin/java\" -jar .* -webSocket -workDir \"/w\" -noCertificateCheck$" "$dir/unit" && grep -q "^ExecStartPre=.*WARN" "$dir/unit"'
+    TLS_MODE=""
+    check "opts http" '[ -z "$(tls_java_opts)" ]'
+
+    if command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=Test CA" -keyout "$dir/ca.key" -out "$dir/ca.pem" >/dev/null 2>&1
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=jenkins.example.com" -keyout "$dir/leaf.key" -out "$dir/leaf.csr" >/dev/null 2>&1
+        openssl x509 -req -in "$dir/leaf.csr" -CA "$dir/ca.pem" -CAkey "$dir/ca.key" -CAcreateserial -days 2 -out "$dir/leaf.pem" >/dev/null 2>&1
+        check "kendinden imzali" 'is_self_signed "$dir/ca.pem"'
+        check "site sertifikasi kok degil" '! is_self_signed "$dir/leaf.pem"'
+        check "parmak izi" '[ "$(cert_sha256 "$dir/ca.pem")" = "$(normalize_sha256 "$(openssl x509 -noout -fingerprint -sha256 -in "$dir/ca.pem")")" ] && [ "$(cert_sha256 "$dir/ca.pem")" != "$(cert_sha256 "$dir/leaf.pem")" ]'
+        check "zincirden en ust" '[ "$(cat "$dir/leaf.pem" "$dir/ca.pem" | last_pem_cert | openssl x509 -noout -subject -nameopt RFC2253)" = "subject=CN=Test CA" ]'
+    else
+        echo "SKIP  openssl yok, sertifika testleri atlandi"
+    fi
     rm -rf "$dir"
     [ "$failed" -eq 0 ] || { echo "$failed test basarisiz."; return 1; }
     echo "Tum testler gecti."
@@ -418,6 +676,11 @@ parse_args() {
             --user) AGENT_USER=${2:?--user degeri eksik}; shift 2 ;;
             --java-home) JAVA_HOME_IN=${2:?--java-home degeri eksik}; shift 2 ;;
             --java-version) JAVA_VERSION=${2:?--java-version degeri eksik}; shift 2 ;;
+            --trusted-cert-sha256)
+                TRUSTED_SHA256=$(normalize_sha256 "${2:?--trusted-cert-sha256 degeri eksik}") || die "Gecersiz --trusted-cert-sha256: $2"
+                shift 2
+                ;;
+            --skip-certificate-check) SKIP_CERT_CHECK=1; shift ;;
             --non-interactive) NON_INTERACTIVE=1; shift ;;
             -y | --yes) ASSUME_YES=1; shift ;;
             --uninstall) UNINSTALL=1; shift ;;
