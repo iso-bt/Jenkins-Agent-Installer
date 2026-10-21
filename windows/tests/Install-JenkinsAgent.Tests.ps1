@@ -61,7 +61,7 @@ Assert-True 'bosluklu ad red'     { -not (Test-AgentName 'build 01') }
 Assert-True 'yol karakteri red'   { -not (Test-AgentName 'a\b') }
 $prevCulture = [Threading.Thread]::CurrentThread.CurrentCulture
 [Threading.Thread]::CurrentThread.CurrentCulture = 'tr-TR'
-Assert-True 'tr-TR buyuk I'       { Test-AgentName 'X2IBSTSTAPPSERV' }
+Assert-True 'tr-TR buyuk I'       { Test-AgentName 'BUILDIST01' }
 [Threading.Thread]::CurrentThread.CurrentCulture = $prevCulture
 $pattern = Get-AgentNamePattern 'build-01'
 Assert-True 'ad eslesir'          { 'java -jar C:\a\agent.jar -url x -name build-01 -webSocket' -match $pattern }

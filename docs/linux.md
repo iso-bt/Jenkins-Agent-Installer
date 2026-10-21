@@ -16,7 +16,7 @@ değiştirin. `<secret>`, `<sha256>`, `<jdk-klasoru>` gibi işaretleri de gerçe
 6. [HTTPS sertifikası](#6-https-sertifikası)
 7. [Yeniden çalıştırma ve güncelleme](#7-yeniden-çalıştırma-ve-güncelleme)
 8. [Kaldırma](#8-kaldırma)
-9. [İşletim: durum, loglar, yeniden başlatma](#9-işletim-durum-loglar-yeniden-başlatma)
+9. [Durum, loglar ve yeniden başlatma](#9-durum-loglar-ve-yeniden-başlatma)
 10. [Sorun giderme](#10-sorun-giderme)
 11. [Güvenlik notları](#11-güvenlik-notları)
 
@@ -29,7 +29,7 @@ değiştirin. `<secret>`, `<sha256>`, `<jdk-klasoru>` gibi işaretleri de gerçe
 | Yetki | root ya da `sudo`. Root değilse script `sudo` ile kendini yeniden çalıştırır. |
 | Java | Sürüm 17 veya üstü. Script Temurin indirebilir (varsayılan 25, x64 ve aarch64) ya da mevcut bir Java yolu kullanılır. |
 | İndirme aracı | `curl` (https adresi için zorunlu) ya da `wget` (yalnızca indirme yedeği). `tar` Temurin için gerekir. |
-| Sertifika | `openssl` (sertifika sabitleme ve sertifika kontrolü kararı için). `timeout` (coreutils) de gerekir. |
+| Sertifika | `openssl` ve `timeout` (coreutils): sertifika sistemce güvenilmiyorsa (kontrol kapatılacak olsa bile) ya da Java sistem deposu yoksa gerekir. |
 | Java sistem deposu | Sistem Java deposu kullanılacaksa Debian/Ubuntu'da `ca-certificates-java`, RHEL ailesinde `java` deposu (`/etc/pki/ca-trust/extracted/java/cacerts`) olmalı. Yoksa script sertifikayı sabitler. |
 | Ağ (Jenkins) | Makineden Jenkins adresine çıkış. Agent WebSocket ile bağlanır. |
 | Ağ (indirme) | Temurin indirilecekse `api.adoptium.net` ve `github.com` erişimi. `agent.jar` Jenkins sunucusundan iner. |
@@ -122,14 +122,14 @@ varsayılanı kabul eder.
   `<kurulum dizini>/java/` altına açılır.
 - **2 (yol yaz):** JAVA_HOME dizini, `bin` dizini ya da `java` dosyasının yolu girilir.
 
-Her iki durumda `java -version` çalıştırılır ve ana sürüm 17 ya da üstü değilse script durur.
+Her seçenekte `java -version` çalıştırılır ve ana sürüm 17 ya da üstü olmalıdır. Etkileşimli modda 2. seçenekte (yol yazma) geçersiz sürüm ya da yol verilirse script yeni yol sorar. Temurin indirmede ya da `--non-interactive` modunda kurulum durur.
 
 Kurulum sonunda şuna benzer bir özet çıkar:
 
 ```text
 Kurulum tamamlandi.
-  Durum : systemctl status jenkins-agent-build-01
-  Log   : journalctl -u jenkins-agent-build-01 -f
+  Durum : systemctl status jenkins-agent-build-01.service
+  Log   : journalctl -u jenkins-agent-build-01.service -f
   Remoting logu: /var/lib/jenkins-agent/remoting/logs
 ```
 
@@ -178,7 +178,7 @@ boşluk olmamalıdır.
 Kurulum:
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive
 ```
 
 Script secret'ı bu dosyadan okur, `/etc/jenkins-agent/build-01.secret` dosyasına yazar ve kaynak dosyaya
@@ -186,13 +186,14 @@ dokunmaz. Kaynak dosyayı kurulumdan sonra silebilirsiniz.
 
 ### 5.2 Ortam değişkeni ile secret
 
-`JENKINS_SECRET` ortam değişkeni de desteklenir. Dikkat: `sudo JENKINS_SECRET=... ./script` biçimi, çoğu sudo
-yapılandırmasında değişkeni sudo'nun ortamından düşürür ve secret eksik kalır. Bu nedenle bu biçim önerilmez;
-değişkeni root kabuğunda ya da sudo'ya girmeden tanımlayın:
+`JENKINS_SECRET` ortam değişkeni de desteklenir. `sudo JENKINS_SECRET=<secret> bash install-jenkins-agent.sh ...`
+biçimi sudoers kuralına bağlıdır: kural `ALL` ise değişken root'a aktarılır; kısıtlı bir kuralda sudo bu değişkeni
+reddeder ve komut hata verip durur (sessizce düşürülmez). Kuralınızı bilmiyorsanız değişkeni root kabuğunda ya da
+sudo'ya girmeden tanımlayın:
 
 ```bash
 export JENKINS_SECRET='<secret>'
-sudo -E ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
+sudo -E bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
 ```
 
 `-E` sudo yapılandırmanıza bağlı olarak reddedilebilir. Bu durumda `--secret-file` kullanın. Bu biçimde
@@ -204,13 +205,13 @@ yazın.
 Temurin indirme, farklı sürümle (`--java-version`):
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-version 21 --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-version 21 --secret-file /root/build-01.secret --non-interactive
 ```
 
 Mevcut Java kullanmak:
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-home /usr/lib/jvm/temurin-21-jdk-amd64 --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-home /usr/lib/jvm/temurin-21-jdk-amd64 --secret-file /root/build-01.secret --non-interactive
 ```
 
 `--java-home` verilen Java'nın sürümü 17 ya da üstü olmalıdır. Java yolu bir dizin, `bin` dizini ya da doğrudan
@@ -225,7 +226,7 @@ başlamaz. Java'yı sistem genelinde erişilebilir bir yere kurun.
 Varsayılan kullanıcı `jenkins`'tir. Farklı bir kullanıcı için:
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --user jenkins-build --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --user jenkins-build --secret-file /root/build-01.secret --non-interactive
 ```
 
 - Kullanıcı yoksa `useradd --system` ile sistem kullanıcısı olarak oluşturulur (kabuk `nologin`, ev dizini
@@ -240,7 +241,7 @@ Sistemin güvenmediği bir Jenkins sertifikasını parmak iziyle sabitlemek içi
 ([6.3](#63-parmak-izini-alma)). Eşleşirse script sormadan sabitler:
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --trusted-cert-sha256 <sha256> --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --trusted-cert-sha256 <sha256> --secret-file /root/build-01.secret --non-interactive
 ```
 
 Parmak izi `AB:CD:..`, `ab cd..` ya da düz hex biçiminde verilebilir; `SHA256 Fingerprint=` öneki de kabul
@@ -252,7 +253,7 @@ adres kullanılıyor olabilir.
 Yalnızca başka seçenek kalmadığında kullanın (bkz. [6.6](#66-kontrolü-kapatmak-güvensiz)):
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --skip-certificate-check --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --skip-certificate-check --secret-file /root/build-01.secret --non-interactive
 ```
 
 Bu modda agent `-noCertificateCheck` ile başlar. Her başlatmada `ExecStartPre` ile journal'a WARN yazılır.
@@ -262,7 +263,7 @@ Bu modda agent `-noCertificateCheck` ile başlar. Her başlatmada `ExecStartPre`
 ### 5.7 Özel dizinler
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --install-dir /srv/jenkins-agent --work-dir /srv/jenkins-work --secret-file /root/build-01.secret --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --install-dir /srv/jenkins-agent --work-dir /srv/jenkins-work --secret-file /root/build-01.secret --non-interactive
 ```
 
 Dizinler mutlaka yerel disk üzerinde olmalıdır. Servis kullanıcısı çalışma dizinine yazabilmelidir; script
@@ -274,7 +275,7 @@ Soru sormadan güncelleme yapmak için (`--non-interactive` ile agent.jar günce
 kullanılır):
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
 ```
 
 Etkileşimli ortamda `-y` onay sorularını evet yapar. Sertifika kararlarını yapmaz; bu kararlar için
@@ -415,19 +416,19 @@ servis yeniden başlatılır (9/9 adımı).
 | Öğe | Yeniden çalıştırmada |
 | --- | --- |
 | `agent.jar` | Sorulur (varsayılan Evet). `--non-interactive` ya da `-y` ile güncellenir. Hayır denirse mevcut dosya kullanılır. |
-| Java | Yeniden seçilir. Temurin indirmede aynı sürüm dizini varsa indirme yapılmaz, mevcut dizin kullanılır. |
+| Java | Yeniden seçilir. Temurin her çalıştırmada yeniden indirilir; aynı sürüm dizini zaten varsa indirilen kopya atılır ve mevcut dizin kullanılır. |
 | Secret dosyası | `--secret-file` ya da `JENKINS_SECRET` verilirse yeni değer yazılır. Verilmezse ve dosya varsa `Mevcut secret dosyasi kullanilsin mi?` sorulur (varsayılan Evet). `--non-interactive` mevcut dosyayı kullanır. |
 | `truststore.p12` | Aynı sertifikaysa yeniden kullanılır. Değişmişse ya da mod değişmişse yeniden yazılır ya da silinir. |
 | Servis dosyası | Her seferinde yeniden yazılır, `daemon-reload` yapılır. |
 | Kullanıcı | Varsa olduğu gibi kalır. |
-| Kurulum ve çalışma dizinleri | Varsa üzerinde işlem yapılmaz; dizinlerin izinleri değiştirilmez. |
+| Kurulum ve çalışma dizinleri | Her çalıştırmada kurulum dizini `755` (root), çalışma dizini servis kullanıcısına ait ve `750` yapılır. Dizinler yoksa oluşturulur. |
 
 Önemli: Güncelleme sırasında çalışan servis durdurulmaz. Servis, 9/9 adımında yeniden başlatılana kadar eski
 `agent.jar` ile çalışmaya devam eder. Jar'ın güncellenmesi sırasında servisin durdurulması daha güvenlidir:
 
 ```bash
-sudo systemctl stop jenkins-agent-build-01
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
+sudo systemctl stop jenkins-agent-build-01.service
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
 ```
 
 9/9 adımına gelinmeden çıkan hatalar çalışan servisi durdurmaz. Ancak 6/9 adımında `truststore.p12` değişmiş
@@ -437,7 +438,7 @@ başlatılana kadar uygulanmaz.
 ### 7.2 Güncelleme komutu
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
 ```
 
 Secret değişmediyse ek bir şey gerekmez. Secret değiştiyse `--secret-file` ile yeni dosyayı verin.
@@ -445,7 +446,7 @@ Secret değişmediyse ek bir şey gerekmez. Secret değiştiyse `--secret-file` 
 ### 7.3 Java değiştirme
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-home /usr/lib/jvm/temurin-21-jdk-amd64 --non-interactive
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --java-home /usr/lib/jvm/temurin-21-jdk-amd64 --non-interactive
 ```
 
 Eski Java dizini otomatik silinmez.
@@ -453,7 +454,7 @@ Eski Java dizini otomatik silinmez.
 ### 7.4 Secret değiştirme
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive -y
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive -y
 ```
 
 ### 7.5 Kurulum dizinini değiştirme
@@ -471,7 +472,7 @@ amacıyla kullanılmaz.
 ## 8. Kaldırma
 
 ```bash
-sudo ./install-jenkins-agent.sh --uninstall --name build-01
+sudo bash install-jenkins-agent.sh --uninstall --name build-01
 ```
 
 Bu komut şunları yapar:
@@ -483,13 +484,13 @@ Bu komut şunları yapar:
 Kurulum dizini farklıysa `--install-dir` ile verin:
 
 ```bash
-sudo ./install-jenkins-agent.sh --uninstall --name build-01 --install-dir /srv/jenkins-agent
+sudo bash install-jenkins-agent.sh --uninstall --name build-01 --install-dir /srv/jenkins-agent
 ```
 
 Sormadan kurulum dizinini de silmek için `-y` ekleyin:
 
 ```bash
-sudo ./install-jenkins-agent.sh --uninstall --name build-01 --install-dir /srv/jenkins-agent -y
+sudo bash install-jenkins-agent.sh --uninstall --name build-01 --install-dir /srv/jenkins-agent -y
 ```
 
 Çalışma dizini (`/var/lib/jenkins-agent`) ve servis kullanıcısı silinmez. Bunları kendiniz kaldırın:
@@ -501,16 +502,16 @@ sudo userdel jenkins
 
 Kullanıcıyı silmeden önce başka bir servisin o kullanıcıyı kullanmadığından emin olun.
 
-## 9. İşletim: durum, loglar, yeniden başlatma
+## 9. Durum, loglar ve yeniden başlatma
 
 Servis adı her zaman `jenkins-agent-<AD>` biçimindedir.
 
 ### 9.1 Durum
 
 ```bash
-systemctl status jenkins-agent-build-01 --no-pager
-systemctl is-enabled jenkins-agent-build-01
-systemctl is-active jenkins-agent-build-01
+systemctl status jenkins-agent-build-01.service --no-pager
+systemctl is-enabled jenkins-agent-build-01.service
+systemctl is-active jenkins-agent-build-01.service
 ```
 
 `Active: active (running)` servisin çalıştığını gösterir. `activating (auto-restart)` ise Java çökmüş ve servis
@@ -519,7 +520,7 @@ systemctl is-active jenkins-agent-build-01
 Unit dosyasının içeriğini görmek için:
 
 ```bash
-systemctl cat jenkins-agent-build-01
+systemctl cat jenkins-agent-build-01.service
 ```
 
 Bu komut secret içermez; yalnızca `@/etc/jenkins-agent/build-01.secret` gibi dosya yolunu gösterir.
@@ -536,25 +537,25 @@ Bir agent için beklenen süreç sayısı 1'dir. Komut satırında secret yoktur
 
 | Log | Konum | İçerik |
 | --- | --- | --- |
-| Servis logu | journal (`journalctl -u jenkins-agent-build-01`) | Java'nın çıktısı, başlatma, çıkış kodu, bağlantı hataları. Bu script'in ana logudur. |
+| Servis logu | journal (`journalctl -u jenkins-agent-build-01.service`) | Java'nın çıktısı, başlatma, çıkış kodu, bağlantı hataları. Bu script'in ana logudur. |
 | Remoting logu | `/var/lib/jenkins-agent/remoting/logs/` | Agent'ın kendi logları: Jenkins'e bağlantı ve WebSocket ayrıntıları. |
 
 Son 200 satır:
 
 ```bash
-journalctl -u jenkins-agent-build-01 -n 200 --no-pager
+journalctl -u jenkins-agent-build-01.service -n 200 --no-pager
 ```
 
 Canlı izleme:
 
 ```bash
-journalctl -u jenkins-agent-build-01 -f
+journalctl -u jenkins-agent-build-01.service -f
 ```
 
 Belirli bir zamandan sonrası:
 
 ```bash
-journalctl -u jenkins-agent-build-01 --since "1 hour ago" --no-pager
+journalctl -u jenkins-agent-build-01.service --since "1 hour ago" --no-pager
 ```
 
 Remoting logunun en yenisi:
@@ -567,9 +568,9 @@ sudo tail -n 100 "/var/lib/jenkins-agent/remoting/logs/<dosya-adi>"
 ### 9.4 Yeniden başlatma ve durdurma
 
 ```bash
-sudo systemctl restart jenkins-agent-build-01
-sudo systemctl stop jenkins-agent-build-01
-sudo systemctl start jenkins-agent-build-01
+sudo systemctl restart jenkins-agent-build-01.service
+sudo systemctl stop jenkins-agent-build-01.service
+sudo systemctl start jenkins-agent-build-01.service
 ```
 
 Servis `Restart=always` ile çalışır; Java çıksa da 10 saniye sonra yeniden başlar. Bilerek durdurmak için
@@ -585,7 +586,7 @@ başladığında servis kendiliğinden çalışır.
 Servis durdurulduktan sonra Java'yı servis kullanıcısı olarak elle çalıştırıp hatayı görebilirsiniz:
 
 ```bash
-sudo systemctl stop jenkins-agent-build-01
+sudo systemctl stop jenkins-agent-build-01.service
 sudo -u jenkins /opt/jenkins-agent/java/<jdk-klasoru>/bin/java -jar /opt/jenkins-agent/agent.jar -url https://jenkins.example.com/ -name build-01 -secret '@/etc/jenkins-agent/build-01.secret' -webSocket -workDir /var/lib/jenkins-agent
 ```
 
@@ -622,7 +623,7 @@ Yapılacaklar: remoting logunu ve journal'ı inceleyin, scripti yeniden çalış
 çıktısındaki modu (`system`, `pinned`, `bypass`) unit dosyasından kontrol edin:
 
 ```bash
-systemctl cat jenkins-agent-build-01 | grep -E 'trustStore|noCertificateCheck'
+systemctl cat jenkins-agent-build-01.service | grep -E 'trustStore|noCertificateCheck'
 ```
 
 ### 10.2 systemd servisi başlamıyor
@@ -642,7 +643,7 @@ systemctl cat jenkins-agent-build-01 | grep -E 'trustStore|noCertificateCheck'
 Jenkins'te node yeniden oluşturulduysa secret değişir. Secret dosyasını güncelleyin:
 
 ```bash
-sudo ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive -y
+sudo bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --secret-file /root/build-01.secret --non-interactive -y
 ```
 
 Journal'da kimlik doğrulama (secret) ile ilgili bir hata varsa secret yanlıştır; Jenkins node sayfasındaki değerle
@@ -710,6 +711,7 @@ Beklenen: sahibi servis kullanıcısı (ör. `jenkins`), izin `-rw-------`. Sahi
   `/etc/jenkins-agent` `755`'tir; dosyanın içeriğini yalnızca sahibi okuyabilir.
 - Kurulum dizini root'a aittir (`755`); servis kullanıcısı kurulum dizinindeki dosyaları değiştiremez. Servis
   kullanıcısı yalnızca çalışma dizinine yazabilir (`750`).
+- Sabitleme modunda `truststore.p12` de servis kullanıcısına ait ve izni `600`'dür.
 - `truststore.p12` sabitleme modunda sahibi servis kullanıcısı ve izni `600` olarak yazılır.
 - `--secret-file` ile verilen kaynak dosyayı kurulumdan sonra silin ya da yalnızca root okuyabilecek şekilde
   tutun.

@@ -33,8 +33,9 @@ Verilmeyen her değer adım adım sorulur. Tüm değerler parametre olarak veril
   Secret değeri node sayfasındaki komutta yer alır.
 - Jenkins sunucusunda WebSocket desteği açık olmalı (agent `-webSocket` ile bağlanır).
 - Windows: Windows 10 / Server 2016 ve üstü, Windows PowerShell 5.1, yönetici yetkisi.
-- Linux: systemd, bash, `curl` veya `wget`, `tar`, root yetkisi (veya sudo). `https` adresi için `curl` gerekir;
-  sertifika sabitlenecekse ayrıca `openssl` gerekir.
+- Linux: systemd, bash, `curl` veya `wget`, `tar`, root yetkisi (veya sudo). `https` adresi için `curl` gerekir.
+  `openssl` ve `timeout` (coreutils), sertifika sistemce güvenilmiyorsa (kontrol kapatılacak olsa bile) ya da Java
+  sistem deposu yoksa gerekir.
 - Java'yı script indirecekse `api.adoptium.net` ve `github.com` adreslerine erişim.
 
 ## HTTPS sertifikası
@@ -45,16 +46,17 @@ sunucu sertifikasını makinedeki sertifika deposuna göre kontrol eder.
 | Durum | Windows | Linux |
 | --- | --- | --- |
 | Sertifika güvenilir | Windows sertifika deposuna göre doğrulanır. Java, `Windows-ROOT` deposunu kullanır. | Sistem sertifika deposuna göre doğrulanır. Java, sistemin `cacerts` deposunu kullanır. Java sistem deposu yoksa (ör. `ca-certificates-java` kurulu değilse) sertifika otomatik sabitlenir ve soru sorulmaz. |
-| Sertifika güvenilmiyor | Aşağıdaki menü açılır. | Aşağıdaki menü açılır (4. adım). |
+| Sertifika güvenilmiyor | Aşağıdaki menü açılır (3. adım). | Aşağıdaki menü açılır (4. adım). |
 
 Güvenilmeyen sertifikada önce konu, yayıncı, geçerlilik tarihleri ve SHA-256 parmak izi gösterilir, sonra menü çıkar:
 
 1. **Sertifikayı sabitle (önerilen):** Onaylanırsa sertifika kurulum klasöründeki `truststore.p12` dosyasına
    `jenkins-ca` takma adıyla yazılır. Sistem sertifika deposuna dokunulmaz. Adres ile sertifikadaki ad
-   eşleşmiyorsa ya da zincir süresi geçmiş, henüz geçerli değil veya hatalıysa bu seçenek sunulmaz (sabitleme
-   bunu çözmez); nedeni gösterilir ve sadece kontrolü kapatma ve iptal kalır. Linux'ta bu durumda menünün
-   varsayılanı iptaldir. Sabitlenecek sertifika sistem deposunda zaten olan genel bir kök CA ise Linux onay
-   sorusundan önce bunu belirtir.
+   Zincir süresi geçmiş, henüz geçerli değil veya hatalıysa bu seçenek sunulmaz (sabitleme bunu çözmez); nedeni
+   gösterilir ve menüde sadece kontrolü kapatma ve iptal kalır. Adres ile sertifikadaki ad eşleşmiyorsa Windows'ta
+   menü hiç açılmaz, kurulum hata verip durur; Linux'ta menü yine yalnızca kontrolü kapatma ve iptal sunar.
+   Sabitlenemeyen durumda menünün varsayılanı iki platformda da iptaldir. Sabitlenecek sertifika sistem deposunda
+   zaten olan genel bir kök CA ise Linux onay sorusundan önce bunu belirtir.
 2. **Sertifika kontrolünü kapat (güvensiz):** Uyarı gösterilir ve ayrıca onay istenir. Agent
    `-noCertificateCheck` ile başlatılır; her başlatmada log'a WARN yazılır.
 3. **İptal:** Kurulum durur.
@@ -76,7 +78,7 @@ Parmak izi menüdeki "SHA-256" satırında görünür; değerini Jenkins yöneti
 ```
 
 ```bash
-sudo JENKINS_SECRET=<secret> ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --trusted-cert-sha256 <sha256> --non-interactive
+sudo JENKINS_SECRET=<secret> bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --trusted-cert-sha256 <sha256> --non-interactive
 ```
 
 Yeniden çalıştırma:
@@ -164,8 +166,8 @@ dosyası varsa `-NonInteractive` ile mevcut dosya kullanılır.
 | --- | --- | --- |
 | 1/8 | Jenkins URL | `http://` veya `https://` ile başlamalı, sonuna `/` eklenir; `https` ise sertifika kontrol edilir |
 | 2/8 | Agent adı | Varsayılan bilgisayar adı |
-| 3/8 | Kurulum ve çalışma klasörü | Yoksa oluşturulur. Sertifika güvenilmiyorsa menü bu adımda açılır |
-| 4/8 | Görev hesabı | `SYSTEM` veya kullanıcı hesabı (parola sorulur) |
+| 3/8 | Kurulum ve çalışma klasörü | Sadece sorulur. Sertifika güvenilmiyorsa menü bu adımda açılır |
+| 4/8 | Görev hesabı | `SYSTEM` veya kullanıcı hesabı (parola sorulur). Klasörler yoksa bu adımda oluşturulur |
 | 5/8 | Java | Aşağıya bakın |
 | 6/8 | `agent.jar` | `<JenkinsUrl>/jnlpJars/agent.jar` adresinden indirilir; dosya varsa güncelleme sorulur. Sabitleme seçildiyse `truststore.p12` bu adımda yazılır |
 | 7/8 | Secret | Ekranda gösterilmeden sorulur; dosya zaten varsa mevcut dosya kullanılabilir |
@@ -242,7 +244,7 @@ Burada da çalıştırmadan önce scripti indirip incelemeniz önerilir.
 | Parametre | Varsayılan | Açıklama |
 | --- | --- | --- |
 | `--url` | (sorulur) | Jenkins adresi |
-| `--name` | hostname | Jenkins'teki node adı |
+| `--name` | `hostname -s` | Jenkins'teki node adı |
 | `--secret-file` | | Secret'ın okunacağı dosya. Alternatif: `JENKINS_SECRET` ortam değişkeni |
 | `--install-dir` | `/opt/jenkins-agent` | `agent.jar` ve indirilen Java'nın yeri |
 | `--work-dir` | `/var/lib/jenkins-agent` | Agent çalışma dizini |
@@ -258,7 +260,7 @@ Burada da çalıştırmadan önce scripti indirip incelemeniz önerilir.
 Soru sormadan kurulum:
 
 ```bash
-sudo JENKINS_SECRET=<secret> ./install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
+sudo JENKINS_SECRET=<secret> bash install-jenkins-agent.sh --url https://jenkins.example.com/ --name build-01 --non-interactive
 ```
 
 Secret'ı komut satırında vermek yerine `--secret-file` kullanmak daha güvenlidir; komut satırı ve shell
@@ -289,8 +291,9 @@ girebilirsiniz. Her durumda sürümün 17 veya üstü olduğu kontrol edilir.
 - Unit dosyası: `/etc/systemd/system/jenkins-agent-<name>.service`
 - `User=<user>`, `WorkingDirectory=<work-dir>`, `Restart=always`, `RestartSec=10`
 - Komut: `java -jar agent.jar -url ... -name ... -secret @/etc/jenkins-agent/<name>.secret -webSocket -workDir ...`
-  Sertifika sabitlendiyse komuta truststore parametreleri, kontrol kapatıldıysa `-noCertificateCheck` eklenir
-  (bu durumda her başlatmada WARN yazılır).
+  Sistem Java deposu kullanılıyorsa komuta `-Djavax.net.ssl.trustStore=<cacerts>` ve parola eklenir; sertifika
+  sabitlendiyse `truststore.p12` parametreleri, kontrol kapatıldıysa `-noCertificateCheck` eklenir (bu durumda her
+  başlatmada WARN yazılır).
 - Servis etkinleştirilir ve başlatılır.
 
 ```bash
@@ -301,7 +304,7 @@ journalctl -u jenkins-agent-build-01 -f
 ### Kaldırma
 
 ```bash
-sudo ./install-jenkins-agent.sh --uninstall --name build-01
+sudo bash install-jenkins-agent.sh --uninstall --name build-01
 ```
 
 Servisi durdurur, unit ve secret dosyasını siler, kurulum dizininin silinip silinmeyeceğini sorar.
@@ -323,6 +326,7 @@ bash linux/install-jenkins-agent.sh --self-test
   değiştiremez. Kurulum ve çalışma klasörünün kendisi sadece script tarafından oluşturulduysa kısıtlanır;
   var olan bir klasörün yetkilerine dokunulmaz.
 - Linux: secret `/etc/jenkins-agent/<name>.secret` dosyasında, sahibi servis kullanıcısı ve izni `600`.
+  Sabitleme modunda `truststore.p12` de aynı şekilde servis kullanıcısına ait ve izni `600`'dür.
   Kurulum dizini root'a aittir; servis kullanıcısı sadece çalışma dizinine yazabilir.
 - Secret etkileşimli modda ekranda gösterilmeden okunur.
 - Java ve `agent.jar` HTTPS üzerinden indirilir. İndirilen dosyaların imza kontrolü yapılmaz.

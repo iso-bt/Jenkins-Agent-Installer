@@ -16,7 +16,7 @@ kendi değerlerinizle değiştirin. `<secret>`, `<sha256>` gibi işaretleri de g
 6. [HTTPS sertifikası](#6-https-sertifikası)
 7. [Yeniden çalıştırma ve güncelleme](#7-yeniden-çalıştırma-ve-güncelleme)
 8. [Kaldırma](#8-kaldırma)
-9. [İşletim: durum, loglar, yeniden başlatma](#9-işletim-durum-loglar-yeniden-başlatma)
+9. [Durum, loglar ve yeniden başlatma](#9-durum-loglar-ve-yeniden-başlatma)
 10. [Sorun giderme](#10-sorun-giderme)
 11. [Güvenlik notları](#11-güvenlik-notları)
 
@@ -97,8 +97,8 @@ sorularda boş Enter varsayılanı kabul eder.
 | --- | --- | --- |
 | 1/8 Jenkins adresi | `Jenkins URL` | Yok, zorunlu. `http://` ya da `https://` ile başlamalı; sonuna `/` eklenir. `https` ise sertifika bu adımda kontrol edilir, karar 3. adımda verilir. |
 | 2/8 Agent adı | `Agent (node) adi` | Bilgisayar adı. Yalnızca harf, rakam, `.`, `-`, `_` kullanılır; ilk karakter harf ya da rakam olmalı. |
-| 3/8 Klasörler | `Kurulum klasoru`, `Calisma klasoru (workDir)` | `C:\jenkins-agent` ve `C:\jenkins`. Klasör yoksa oluşturulur. Sertifika güvenilmiyorsa sertifika menüsü bu adımda açılır. |
-| 4/8 Görev hesabı | `Gorevin calisacagi hesap` | `SYSTEM`. Başka bir hesap yazılırsa parola için bir kimlik bilgisi penceresi açılır. |
+| 3/8 Klasörler | `Kurulum klasoru`, `Calisma klasoru (workDir)` | `C:\jenkins-agent` ve `C:\jenkins` varsayılandır. Sadece sorulur. Sertifika güvenilmiyorsa sertifika menüsü bu adımda açılır. |
+| 4/8 Görev hesabı | `Gorevin calisacagi hesap` | `SYSTEM`. Başka bir hesap yazılırsa parola için bir kimlik bilgisi penceresi açılır. Klasörler yoksa bu adımda oluşturulur. |
 | 5/8 Java | Java seçimi (aşağıda) | Varsayılan `1`: Temurin 25 indir. |
 | 6/8 agent.jar | `agent.jar zaten var, guncellensin mi?` (dosya varsa) | Varsayılan Evet. Sabitleme seçildiyse `truststore.p12` bu adımda yazılır. |
 | 7/8 Secret | `Secret` (ekranda gösterilmez) | Mevcut `secret.txt` varsa `Mevcut secret dosyasi kullanilsin mi?` sorulur, varsayılan Evet. |
@@ -116,7 +116,7 @@ sorularda boş Enter varsayılanı kabul eder.
 - **2 (yol yaz):** JAVA_HOME klasörü, `bin` klasörü ya da doğrudan `java.exe` yolu girilir.
 - **3 (pencereden seç):** Klasör seçme penceresi açılır. Pencere açılamazsa (ör. Server Core) yol elle sorulur.
 
-Her seçenekte `java -version` çalıştırılır ve ana sürüm 17 ya da üstü değilse kurulum durur. Ağ (UNC) yolları
+Her seçenekte `java -version` çalıştırılır ve ana sürüm 17 ya da üstü olmalıdır. Path ve Browse modlarında etkileşimli çalışırken geçersiz sürüm ya da yol verilirse script yeni yol sorar. Download modunda ya da `-NonInteractive` ile kurulum durur. Ağ (UNC) yolları
 kabul edilmez.
 
 Kurulum sonunda şuna benzer bir özet çıkar:
@@ -309,14 +309,18 @@ kontrol eder. Sertifika güvenilirse hiçbir soru sorulmaz ve Java `Windows-ROOT
 
 ### 6.2 Sertifika menüsü
 
-Sertifika doğrulanamazsa script önce sertifikayı gösterir, sonra menüyü açar (Windows'ta 3/8 adımında):
+Sertifika doğrulanamazsa 1/8 adımında bir uyarı yazılır. Sertifika bilgileri ve menü 3/8 adımında çıkar:
 
 ```text
-  Jenkins sertifikasi Windows tarafindan dogrulanamadi (...).
+[1/8] Jenkins adresi
+  Jenkins sertifikasi Windows tarafindan dogrulanamadi (RemoteCertificateChainErrors).
+
+[3/8] Klasorler
   Konu       : CN=jenkins.example.com, ...
   Veren      : CN=Kurum Ara CA, ...
   Gecerlilik : 2025-01-01 - 2027-01-01
   SHA-256    : 0123...ABCD
+  Kok sertifika alinamadi; sitenin kendi sertifikasi sabitlenecek. Sertifika yenilenince bu script tekrar calistirilmali.
   1) Sertifikayi sabitle (onerilen)
   2) Sertifika kontrolunu kapat (guvensiz)
   3) Iptal
@@ -333,7 +337,7 @@ kalır (varsayılan 3). Sertifikayı Jenkins tarafında yenileyin. Bu durumda `-
 edilmez; kurulum hata verip durur.
 
 Adres ile sertifikadaki ad eşleşmiyorsa (`NameMismatch`) menü hiç açılmaz, kurulum bir hata mesajıyla durur.
-Sabitleme bunu çözmez; doğru adresi kullanın. Kontrol kapatılacaksa `-SkipCertificateCheck` gerekir.
+Sabitleme bunu çözmez; doğru adresi kullanın. Kontrol kapatılacaksa `-SkipCertificateCheck` (güvensiz) ile geçilebilir.
 
 ### 6.3 Parmak izini alma
 
@@ -418,7 +422,7 @@ yeniden oluşturulur.
 | Öğe | Yeniden çalıştırmada |
 | --- | --- |
 | `agent.jar` | Sorulur (varsayılan Evet). `-NonInteractive` ya da `-Force` ile güncellenir. Hayır denirse mevcut dosya kullanılır. |
-| Java | Yeniden seçilir. `Download` modunda aynı sürüm klasörü zaten varsa yeniden indirilmez, mevcut klasör kullanılır. |
+| Java | Yeniden seçilir. `Download` modunda Temurin her çalıştırmada yeniden indirilir; aynı sürüm klasörü zaten varsa indirilen kopya atılır ve mevcut klasör kullanılır. |
 | Secret (`secret.txt`) | `-Secret` verilirse yeni değer yazılır. Verilmezse ve dosya varsa `Mevcut secret dosyasi kullanilsin mi?` sorulur (varsayılan Evet). `-NonInteractive` ve `-Force` mevcut dosyayı kullanır. |
 | `truststore.p12` | Aynı sertifika ise yeniden kullanılır. Değişmişse ya da mod değişmişse yeniden yazılır ya da silinir. |
 | `start-agent.ps1` | Her seferinde yeniden üretilir. |
@@ -513,7 +517,7 @@ Uninstall için de yönetici yetkisi gerekir; pencere yönetici değilse script 
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/iso-bt/Jenkins-Agent-Installer/master/windows/Install-JenkinsAgent.ps1))) -Uninstall -AgentName build-01 -NonInteractive -Force
 ```
 
-## 9. İşletim: durum, loglar, yeniden başlatma
+## 9. Durum, loglar ve yeniden başlatma
 
 ### 9.1 Görev durumu
 
@@ -711,8 +715,8 @@ commit sabit adresini kullanın (bkz. [10.1](#101-irm--iex-sözdizimi-hatası-ut
 | `java.exe bulunamadi` | Verilen yol JAVA_HOME, `bin` ya da `java.exe` değil. Yolu kontrol edin. |
 | `Ag (UNC) yolu desteklenmiyor` | Kurulum, çalışma ya da Java yolu ağ paylaşımında. Yerel diske taşıyın. |
 | `Gecersiz agent adi` | Ad harf, rakam, `.`, `-`, `_` dışında karakter içeriyor ya da boşlukla başlıyor. |
-| `Sertifika -TrustedCertThumbprint ile eslesmiyor` | Verilen parmak izi sunucudakiyle farklı. Değeri Jenkins yöneticisiyle doğrulayın. |
-| `Sertifikadaki ad Jenkins adresiyle eslesmiyor` | Adres ile sertifikadaki ad uyuşmuyor. Doğru adresi kullanın. Sabitleme ya da kontrol kapatma bu durumu çözmez. |
+| `Sunucu sertifikasi -TrustedCertThumbprint ile eslesmiyor (sunucu: ...)` | Verilen parmak izi sunucudakiyle farklı. Değeri Jenkins yöneticisiyle doğrulayın. |
+| `Sertifikadaki ad Jenkins adresiyle eslesmiyor` | Adres ile sertifikadaki ad uyuşmuyor. Doğru adresi kullanın. Sabitleme bu durumu çözmez; `-SkipCertificateCheck` (güvensiz) ile geçilebilir. |
 | `keytool.exe bulunamadi` | Seçilen Java'da `bin\keytool.exe` yok (ör. yalnızca çalışma zamanı kopyası). Tam JDK ya da Temurin JRE kullanın. |
 | `Jenkins'e baglanilamadi` | Jenkins adresine ağ, DNS ya da güvenlik duvarı sorunu var. Tarayıcıdan ya da `Test-NetConnection jenkins.example.com -Port 443` ile kontrol edin. |
 | `... verilmedi (-NonInteractive modunda parametre olarak verin).` | `-NonInteractive` ile eksik bir değer var. Parametreyi ekleyin. |
