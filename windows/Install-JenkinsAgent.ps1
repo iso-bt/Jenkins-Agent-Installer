@@ -8,6 +8,7 @@
       - agent.jar indirme
       - secret dosyasi (sadece SYSTEM, Administrators ve gorev hesabi okuyabilir)
       - start-agent.ps1 wrapper'i (ayni node icin ikinci java baslatmaz)
+      - Jenkins sertifikasini Windows dogrulayamazsa: onayla sabitleme (truststore.p12) veya kontrolu kapatma
       - "JenkinsAgent-<AgentName>" zamanlanmis gorevi (acilista + dakikada bir)
 
     Windows PowerShell 5.1 ile calisir. Yonetici yetkisi gerekir.
@@ -38,7 +39,11 @@ param(
     # Soru sorma; verilmeyen degerler icin varsayilanlari kullan.
     [switch] $NonInteractive,
     # Onay sorularina (agent.jar ustune yaz, klasoru sil vb.) evet de.
-    [switch] $Force
+    [switch] $Force,
+    # Windows'un dogrulayamadigi Jenkins sertifikasini sormadan sabitle (SHA-256, hex).
+    [string] $TrustedCertThumbprint,
+    # Jenkins sertifikasi hic dogrulanmaz. Guvensiz, sadece son care.
+    [switch] $SkipCertificateCheck
 )
 
 $ScriptUrl = 'https://raw.githubusercontent.com/iso-bt/Jenkins-Agent-Installer/master/windows/Install-JenkinsAgent.ps1'
@@ -47,6 +52,9 @@ $DefaultInstallDir = 'C:\jenkins-agent'
 $DefaultWorkDir = 'C:\jenkins'
 $MinJavaMajor = 17
 $TotalSteps = 8
+$TrustStoreFile = 'truststore.p12'
+# Gizli degil: truststore sadece herkese acik bir sertifika icerir, keytool bos parola kabul etmez.
+$TrustStorePassword = 'changeit'
 
 $BoundArgs = @{}
 if ($PSBoundParameters) {
@@ -172,6 +180,233 @@ function Get-TemurinUrl([int] $Version, [string] $ImageType) {
 
 function Save-Download([string] $Url, [string] $OutFile) {
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+}
+
+# Sertifika callback'leri C# icinde: PowerShell scriptblock'u thread pool'da "no Runspace" ile patlar.
+# Dogrulama sadece bu isteklerde degisir, ServicePointManager'a global callback konmaz.
+$TlsHelperSource = @'
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+public class JenkinsAgentTlsProbe {
+    public bool Trusted;
+    public string PolicyErrors;
+    public byte[] TopCertificate;
+}
+
+public static class JenkinsAgentTls {
+    const X509ChainStatusFlags AllowedStatus = X509ChainStatusFlags.UntrustedRoot | X509ChainStatusFlags.PartialChain |
+        X509ChainStatusFlags.RevocationStatusUnknown | X509ChainStatusFlags.OfflineRevocation;
+
+    static HttpWebRequest CreateRequest(string url, RemoteCertificateValidationCallback callback) {
+        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+        request.Timeout = 30000;
+        request.KeepAlive = false;
+        request.ServerCertificateValidationCallback = callback;
+        return request;
+    }
+
+    public static string GetSha256(byte[] data) {
+        using (SHA256 sha = SHA256.Create()) {
+            return BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "");
+        }
+    }
+
+    // Normal Windows dogrulamasi; basarisizsa zincirin en ustundeki sertifika (varsa kok) saklanir.
+    public static JenkinsAgentTlsProbe Probe(string url) {
+        JenkinsAgentTlsProbe result = new JenkinsAgentTlsProbe();
+        HttpWebRequest request = CreateRequest(url, delegate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+            result.PolicyErrors = errors.ToString();
+            if (chain != null && chain.ChainElements.Count > 0) {
+                result.TopCertificate = chain.ChainElements[chain.ChainElements.Count - 1].Certificate.RawData;
+            } else if (cert != null) {
+                result.TopCertificate = cert.GetRawCertData();
+            }
+            return errors == SslPolicyErrors.None;
+        });
+        request.Method = "HEAD";
+        try {
+            request.GetResponse().Close();
+        } catch (WebException ex) {
+            // HTTP hata kodu (403 vb.) TLS'in basarili oldugunu gosterir.
+            if (ex.Response != null) {
+                ex.Response.Close();
+            } else if (result.PolicyErrors == null || result.PolicyErrors == "None") {
+                throw;
+            }
+        }
+        result.Trusted = (result.PolicyErrors == null || result.PolicyErrors == "None");
+        return result;
+    }
+
+    // Ad eslesmeli, imzalar gecerli ve sabitlenen sertifika zincirde olmali; sadece "kok guvenilmiyor" hos gorulur.
+    public static bool IsPinnedChainValid(X509Chain chain, SslPolicyErrors errors, string pinnedSha256) {
+        if (errors == SslPolicyErrors.None) return true;
+        if ((errors & ~SslPolicyErrors.RemoteCertificateChainErrors) != SslPolicyErrors.None || chain == null) return false;
+        bool found = false;
+        foreach (X509ChainElement element in chain.ChainElements) {
+            foreach (X509ChainStatus status in element.ChainElementStatus) {
+                if ((status.Status & ~AllowedStatus) != X509ChainStatusFlags.NoError) return false;
+            }
+            if (GetSha256(element.Certificate.RawData) == pinnedSha256) found = true;
+        }
+        return found;
+    }
+
+    // pinnedSha256 bossa sertifika hic dogrulanmaz (kullanici acikca secti). PowerShell $null'i "" olarak gecirir.
+    public static void Download(string url, string path, string pinnedSha256) {
+        HttpWebRequest request = CreateRequest(url, delegate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+            return String.IsNullOrEmpty(pinnedSha256) || IsPinnedChainValid(chain, errors, pinnedSha256);
+        });
+        using (WebResponse response = request.GetResponse())
+        using (Stream input = response.GetResponseStream())
+        using (FileStream output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None)) {
+            input.CopyTo(output);
+        }
+    }
+}
+'@
+
+function Initialize-TlsHelper {
+    if (-not ('JenkinsAgentTls' -as [type])) { Add-Type -TypeDefinition $TlsHelperSource -IgnoreWarnings -WarningAction SilentlyContinue }
+}
+
+function ConvertTo-Thumbprint([string] $Value) {
+    # "AB:CD..", "ab cd..", "AB-CD.." -> "ABCD.."; 64 hane hex degilse $null.
+    $hex = ("$Value" -replace '[\s:-]', '').ToUpperInvariant()
+    if ($hex -cmatch '^[0-9A-F]{64}$') { return $hex }
+    return $null
+}
+
+function Test-IsSelfIssued([string] $Subject, [string] $Issuer) {
+    return ($Subject -eq $Issuer)
+}
+
+function Get-TrustStoreThumbprint([string] $Path) {
+    # Okunamayan truststore yok sayilir; kurulum sertifikayi tekrar sorar.
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        $certs = New-Object Security.Cryptography.X509Certificates.X509Certificate2Collection
+        $certs.Import($Path, $TrustStorePassword, 'DefaultKeySet')
+        return @($certs | ForEach-Object { [JenkinsAgentTls]::GetSha256($_.RawData) })
+    } catch {
+        return @()
+    }
+}
+
+function Get-JenkinsTls([string] $Url) {
+    # http'de TLS yok, Windows modu kalir.
+    if ($Url -notmatch '^https://') { return $null }
+    Initialize-TlsHelper
+    try {
+        $probe = [JenkinsAgentTls]::Probe($Url)
+    } catch {
+        throw "Jenkins'e baglanilamadi ($Url): $($_.Exception.GetBaseException().Message)"
+    }
+    if ($probe.Trusted) {
+        Write-Ok 'Jenkins sertifikasi Windows tarafindan dogrulandi.'
+    } else {
+        Write-Warn "Jenkins sertifikasi Windows tarafindan dogrulanamadi ($($probe.PolicyErrors))."
+    }
+    return $probe
+}
+
+function Show-Certificate([byte[]] $Data) {
+    $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2(, $Data)
+    Write-Info "Konu       : $($cert.Subject)"
+    Write-Info "Veren      : $($cert.Issuer)"
+    Write-Info ("Gecerlilik : {0:yyyy-MM-dd} - {1:yyyy-MM-dd}" -f $cert.NotBefore, $cert.NotAfter)
+    Write-Info "SHA-256    : $([JenkinsAgentTls]::GetSha256($Data))"
+    if (-not (Test-IsSelfIssued $cert.Subject $cert.Issuer)) {
+        Write-Warn 'Kok sertifika alinamadi; sitenin kendi sertifikasi sabitlenecek. Sertifika yenilenince bu script tekrar calistirilmali.'
+    }
+}
+
+function Resolve-TrustMode($Probe, [string] $TrustStorePath) {
+    if ((-not $Probe) -or $Probe.Trusted) { return @{ Mode = 'Windows' } }
+    # -Force guven sorularina kendiliginden evet demesin; Confirm-Choice $Force'u bu kapsamdan okur.
+    $Force = $false
+    $insecure = @{ Mode = 'Insecure' }
+    $pinned = @{ Mode = 'Pinned'; Certificate = $Probe.TopCertificate }
+    $sha = [JenkinsAgentTls]::GetSha256($Probe.TopCertificate)
+    if ($SkipCertificateCheck) {
+        Write-Warn 'Sertifika kontrolu kapali (-SkipCertificateCheck).'
+        return $insecure
+    }
+    if ($Probe.PolicyErrors -match 'NameMismatch') {
+        throw 'Sertifikadaki ad Jenkins adresiyle eslesmiyor; sabitleme bunu cozmez. Dogru adresi kullanin veya -SkipCertificateCheck verin.'
+    }
+    if ($TrustedCertThumbprint) {
+        $expected = ConvertTo-Thumbprint $TrustedCertThumbprint
+        if (-not $expected) { throw "Gecersiz -TrustedCertThumbprint: $TrustedCertThumbprint (64 haneli SHA-256 hex)." }
+        if ($expected -ne $sha) { throw "Sunucu sertifikasi -TrustedCertThumbprint ile eslesmiyor (sunucu: $sha)." }
+        Write-Ok "Sertifika -TrustedCertThumbprint ile eslesti, sabitleniyor."
+        return $pinned
+    }
+    if ((Get-TrustStoreThumbprint $TrustStorePath) -contains $sha) {
+        Write-Ok 'Ayni sertifika zaten sabitlenmis, mevcut truststore kullaniliyor.'
+        return $pinned
+    }
+    $hint = 'Sirket kok sertifikasini (root CA) Windows sertifika deposuna yukleyip tekrar calistirin.'
+    if ($NonInteractive) { throw "Jenkins sertifikasi dogrulanamadi. $hint Ya da -TrustedCertThumbprint $sha veya -SkipCertificateCheck verin." }
+    Show-Certificate $Probe.TopCertificate
+    Write-Info '1) Sertifikayi sabitle (onerilen)'
+    Write-Info '2) Sertifika kontrolunu kapat (guvensiz)'
+    Write-Info '3) Iptal'
+    switch (Read-Value 'Secim' '1') {
+        '1' { if (Confirm-Choice 'Bu sertifikaya guvenilsin mi?' $false) { return $pinned } }
+        '2' {
+            Write-Warn 'UYARI: Sertifika kontrolu kapanirsa agda araya giren biri Jenkins gibi davranip secret''i ele gecirebilir ve agent''a is (kod) gonderebilir.'
+            if (Confirm-Choice 'Sertifika kontrolu yine de kapatilsin mi?' $false) { return $insecure }
+        }
+    }
+    throw "Kurulum iptal edildi. $hint"
+}
+
+function Set-TrustStore($Trust, [string] $JavaExe, [string] $Path, $Identity) {
+    # Mod tutarli kalsin: sabitleme yoksa eski truststore silinir.
+    if ($Trust.Mode -ne 'Pinned') {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force
+            Write-Info "Kullanilmayan truststore silindi: $Path"
+        }
+        return
+    }
+    if ((Get-TrustStoreThumbprint $Path) -notcontains [JenkinsAgentTls]::GetSha256($Trust.Certificate)) {
+        $keytool = Join-Path (Split-Path -Parent $JavaExe) 'keytool.exe'
+        if (-not (Test-Path -LiteralPath $keytool)) { throw "keytool.exe bulunamadi: $keytool" }
+        $cer = Join-Path $env:TEMP ('jenkins-ca-{0}.cer' -f [guid]::NewGuid())
+        try {
+            [IO.File]::WriteAllBytes($cer, $Trust.Certificate)
+            if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+            # keytool stderr'e yazabilir; 5.1'de Stop tercihinde bu bir hata kaydina donusur.
+            $ErrorActionPreference = 'Continue'
+            $output = (& $keytool -importcert -noprompt -alias jenkins-ca -file $cer -storetype PKCS12 -keystore $Path -storepass $TrustStorePassword 2>&1 | ForEach-Object { "$_" }) -join ' '
+            if ($LASTEXITCODE -ne 0) { throw "truststore olusturulamadi: $output" }
+        } finally {
+            Remove-Item -LiteralPath $cer -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Set-RestrictedAcl -Path $Path -Identity $Identity -Rights 'Read'
+    Write-Ok "Sertifika sabitlendi: $Path"
+}
+
+function Get-TrustArgument([string] $TrustMode, [string] $TrustStore, [string] $Password) {
+    # -D argumanlari tek parca string olmali: PowerShell tirnaksiz -Dfoo.bar'i noktalardan boler.
+    if ($TrustMode -eq 'Pinned') {
+        return @{
+            Java  = @(('-Djavax.net.ssl.trustStore=' + $TrustStore), '-Djavax.net.ssl.trustStoreType=PKCS12', ('-Djavax.net.ssl.trustStorePassword=' + $Password))
+            Agent = @()
+        }
+    }
+    # Kurum ici CA ile imzali Jenkins sertifikalari icin Java, Windows sertifika deposuna guvenir.
+    $windows = @('-Djavax.net.ssl.trustStoreType=Windows-ROOT')
+    if ($TrustMode -eq 'Insecure') { return @{ Java = $windows; Agent = @('-noCertificateCheck') } }
+    return @{ Java = $windows; Agent = @() }
 }
 
 function Install-Temurin([int] $Version, [string] $JavaRoot, $Identity) {
@@ -395,6 +630,10 @@ $AgentJar   = __AGENT_JAR__
 $SecretFile = __SECRET_FILE__
 $WorkDir    = __WORK_DIR__
 $LogPath    = __LOG_PATH__
+# Windows | Pinned (kurulumda sabitlenen sertifika, truststore) | Insecure (sertifika kontrolu yok)
+$TrustMode  = __TRUST_MODE__
+$TrustStore = __TRUST_STORE__
+$TrustStorePassword = __TRUST_STORE_PASSWORD__
 
 $MaxLogBytes  = 1MB
 $KeepLogLines = 200
@@ -430,28 +669,34 @@ if (-not (Test-Path -LiteralPath $JavaExe)) {
 
 Write-Log ("START '{0}' icin agent calismiyor, baslatiliyor: {1}" -f $AgentName, $JavaExe)
 
-$javaArgs = @(
-    # Kurum ici CA ile imzali Jenkins sertifikalari icin Java, Windows sertifika deposuna guvenir.
-    '-Djavax.net.ssl.trustStoreType=Windows-ROOT',
+$trust = Get-TrustArgument $TrustMode $TrustStore $TrustStorePassword
+if ($TrustMode -eq 'Insecure') {
+    Write-Log ("WARN '{0}' sertifika kontrolu kapali (-noCertificateCheck); agda araya giren biri secret'i ele gecirebilir." -f $AgentName)
+}
+
+$javaArgs = @($trust.Java) + @(
     '-jar', $AgentJar,
     '-url', $JenkinsUrl,
     '-secret', ('@' + $SecretFile),
     '-name', $AgentName,
     '-webSocket',
     '-workDir', $WorkDir
-)
+) + @($trust.Agent)
 
 $ErrorActionPreference = 'Continue'
 & $JavaExe @javaArgs
 $code = $LASTEXITCODE
 
 Write-Log ("EXIT '{0}' java cikis kodu {1}" -f $AgentName, $code)
+if ($code -ne 0 -and $TrustMode -eq 'Pinned') {
+    Write-Log ("WARN '{0}' sabitlenen sertifika kullaniliyor; remoting logunda PKIX hatasi varsa Jenkins sertifikasi degismistir, Install-JenkinsAgent.ps1'i tekrar calistirin." -f $AgentName)
+}
 exit $code
 '@
 
 function New-WrapperScript {
-    param([string] $AgentName, [string] $JenkinsUrl, [string] $JavaExe, [string] $InstallDir, [string] $WorkDir)
-    $functions = @('Get-AgentNamePattern', 'Get-AgentProcess') | ForEach-Object {
+    param([string] $AgentName, [string] $JenkinsUrl, [string] $JavaExe, [string] $InstallDir, [string] $WorkDir, [string] $TrustMode = 'Windows')
+    $functions = @('Get-AgentNamePattern', 'Get-AgentProcess', 'Get-TrustArgument') | ForEach-Object {
         "function $_ {`r`n" + (Get-Item "function:$_").ScriptBlock.ToString().Trim() + "`r`n}"
     }
     $values = @{
@@ -462,6 +707,9 @@ function New-WrapperScript {
         '__SECRET_FILE__' = (Join-Path $InstallDir 'secret.txt')
         '__WORK_DIR__'    = $WorkDir
         '__LOG_PATH__'    = (Join-Path $InstallDir 'agent.log')
+        '__TRUST_MODE__'  = $TrustMode
+        '__TRUST_STORE__' = (Join-Path $InstallDir $TrustStoreFile)
+        '__TRUST_STORE_PASSWORD__' = $TrustStorePassword
     }
     $text = $WrapperTemplate.Replace('__AGENT_FUNCTIONS__', ($functions -join "`r`n`r`n"))
     foreach ($key in $values.Keys) { $text = $text.Replace($key, (ConvertTo-PsLiteral $values[$key])) }
@@ -536,7 +784,7 @@ function Initialize-Directory([string] $Path, $Identity) {
     Set-RestrictedAcl -Path $Path -Identity $Identity -Rights 'Modify'
 }
 
-function Save-AgentJar([string] $Url, [string] $Path, $Identity) {
+function Save-AgentJar([string] $Url, [string] $Path, $Identity, $Trust) {
     $update = (-not (Test-Path -LiteralPath $Path)) -or (Confirm-Choice 'agent.jar zaten var, guncellensin mi?' $true)
     New-LockedFile -Path $Path -Identity $Identity -Rights 'ReadAndExecute'
     if (-not $update) {
@@ -545,7 +793,13 @@ function Save-AgentJar([string] $Url, [string] $Path, $Identity) {
     }
     Write-Info "Indiriliyor: $Url"
     try {
-        Save-Download $Url $Path
+        if ($Trust.Mode -eq 'Pinned') {
+            [JenkinsAgentTls]::Download($Url, $Path, [JenkinsAgentTls]::GetSha256($Trust.Certificate))
+        } elseif ($Trust.Mode -eq 'Insecure') {
+            [JenkinsAgentTls]::Download($Url, $Path, '')
+        } else {
+            Save-Download $Url $Path
+        }
     } catch [IO.IOException] {
         # Farkli adla veya eski yontemle (-jnlpUrl) baslatilmis bir agent jar'i tutuyor olabilir.
         $holders = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='java.exe'" |
@@ -569,6 +823,7 @@ function Invoke-Install {
     $url = $JenkinsUrl
     if (-not $url) { $url = Read-Value 'Jenkins URL (ornek: https://jenkins.example.com/)' '' -Required }
     $url = Get-NormalizedJenkinsUrl $url
+    $tls = Get-JenkinsTls $url
 
     Write-Step 2 'Agent adi'
     $name = Read-AgentName
@@ -580,6 +835,9 @@ function Invoke-Install {
     if (-not $workPath) { $workPath = Read-Value 'Calisma klasoru (workDir)' $DefaultWorkDir -Required }
     Assert-LocalPath $installPath
     Assert-LocalPath $workPath
+    # Sertifika karari burada: mevcut truststore'u gormek icin kurulum klasoru gerekli.
+    $trustStorePath = Join-Path $installPath $TrustStoreFile
+    $trust = Resolve-TrustMode -Probe $tls -TrustStorePath $trustStorePath
 
     Write-Step 4 'Gorev hesabi'
     $credential = Read-RunAsCredential
@@ -600,7 +858,8 @@ function Invoke-Install {
     Stop-AgentProcess $name
 
     Write-Step 6 'agent.jar'
-    Save-AgentJar -Url (Get-AgentJarUrl $url) -Path (Join-Path $installPath 'agent.jar') -Identity $identity
+    Set-TrustStore -Trust $trust -JavaExe $javaExe -Path $trustStorePath -Identity $identity
+    Save-AgentJar -Url (Get-AgentJarUrl $url) -Path (Join-Path $installPath 'agent.jar') -Identity $identity -Trust $trust
 
     Write-Step 7 'Secret'
     $secretPath = Join-Path $installPath 'secret.txt'
@@ -615,7 +874,7 @@ function Invoke-Install {
 
     Write-Step 8 'Zamanlanmis gorev'
     $wrapperPath = Join-Path $installPath 'start-agent.ps1'
-    $wrapper = New-WrapperScript -AgentName $name -JenkinsUrl $url -JavaExe $javaExe -InstallDir $installPath -WorkDir $workPath
+    $wrapper = New-WrapperScript -AgentName $name -JenkinsUrl $url -JavaExe $javaExe -InstallDir $installPath -WorkDir $workPath -TrustMode $trust.Mode
     New-LockedFile -Path $wrapperPath -Identity $identity -Rights 'ReadAndExecute'
     [IO.File]::WriteAllText($wrapperPath, $wrapper, (New-Object Text.UTF8Encoding($true)))
     Register-AgentTask -TaskName $taskName -WrapperPath $wrapperPath -InstallDir $installPath -Account $account -Credential $credential

@@ -101,7 +101,53 @@ Assert-True 'wrapper parse hatasiz'   { $parseErrors.Count -eq 0 }
 Assert-True 'wrapper yer tutucu yok'  { $wrapper -notmatch '__[A-Z_]+__' }
 Assert-True 'wrapper tirnak kacisi'   { $wrapper.Contains("`$JavaExe    = 'C:\o''java\bin\java.exe'") }
 Assert-True 'wrapper secret dosyadan' { $wrapper.Contains("'-secret', ('@' + `$SecretFile)") -and $wrapper.Contains("C:\jenkins-agent\secret.txt") }
-Assert-True 'wrapper fonksiyonlar'    { $wrapper.Contains('function Get-AgentProcess {') -and $wrapper.Contains('function Get-AgentNamePattern {') }
+Assert-True 'wrapper fonksiyonlar'    { $wrapper.Contains('function Get-AgentProcess {') -and $wrapper.Contains('function Get-AgentNamePattern {') -and $wrapper.Contains('function Get-TrustArgument {') }
+Assert-True 'wrapper varsayilan Windows' { $wrapper.Contains("`$TrustMode  = 'Windows'") }
+foreach ($mode in 'Pinned', 'Insecure') {
+    $modeWrapper = New-WrapperScript -AgentName 'build-01' -JenkinsUrl 'https://jenkins.example.com/' -JavaExe 'C:\java\bin\java.exe' -InstallDir 'C:\jenkins agent' -WorkDir 'C:\jenkins' -TrustMode $mode
+    $modeErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($modeWrapper, [ref]$null, [ref]$modeErrors) | Out-Null
+    Assert-True "wrapper $mode parse hatasiz" { $modeErrors.Count -eq 0 }
+    Assert-True "wrapper $mode modu"          { $modeWrapper.Contains("`$TrustMode  = '$mode'") -and $modeWrapper.Contains("`$TrustStore = 'C:\jenkins agent\truststore.p12'") }
+}
+
+# Sertifika
+$pinnedArgs = Get-TrustArgument 'Pinned' 'C:\a b\truststore.p12' 'changeit'
+Assert-True 'pinned java argumanlari' { ($pinnedArgs.Java -join '|') -eq '-Djavax.net.ssl.trustStore=C:\a b\truststore.p12|-Djavax.net.ssl.trustStoreType=PKCS12|-Djavax.net.ssl.trustStorePassword=changeit' }
+Assert-True 'pinned agent argumani yok' { @($pinnedArgs.Agent).Count -eq 0 }
+$windowsArgs = Get-TrustArgument 'Windows' 'x' 'y'
+Assert-True 'windows java argumani'   { ($windowsArgs.Java -join '|') -eq '-Djavax.net.ssl.trustStoreType=Windows-ROOT' -and @($windowsArgs.Agent).Count -eq 0 }
+$insecureArgs = Get-TrustArgument 'Insecure' 'x' 'y'
+Assert-True 'insecure agent argumani' { ($insecureArgs.Agent -join '|') -eq '-noCertificateCheck' -and -not (($insecureArgs.Java -join ' ') -match 'trustStore=') }
+Assert-True 'storepass sabit'         { $TrustStorePassword -eq 'changeit' -and $TrustStoreFile -eq 'truststore.p12' }
+$sha = 'BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD'
+Assert-True 'thumbprint ayni'         { (ConvertTo-Thumbprint $sha) -eq $sha }
+Assert-True 'thumbprint kucuk ve :'   { (ConvertTo-Thumbprint (($sha.ToLowerInvariant() -split '(..)' | Where-Object { $_ }) -join ':')) -eq $sha }
+Assert-True 'thumbprint bosluklu'     { (ConvertTo-Thumbprint (' ' + $sha.Substring(0, 32) + ' ' + $sha.Substring(32) + ' ')) -eq $sha }
+Assert-True 'thumbprint kisa red'     { $null -eq (ConvertTo-Thumbprint 'ABCD') }
+Assert-True 'thumbprint SHA-1 red'    { $null -eq (ConvertTo-Thumbprint ('A' * 40)) }
+Assert-True 'thumbprint hex disi red' { $null -eq (ConvertTo-Thumbprint ('G' * 64)) }
+Assert-True 'thumbprint bos red'      { $null -eq (ConvertTo-Thumbprint '') }
+Assert-True 'kendinden imzali'        { Test-IsSelfIssued 'CN=Corp Root, DC=corp' 'CN=Corp Root, DC=corp' }
+Assert-True 'site sertifikasi'        { -not (Test-IsSelfIssued 'CN=jenkins.corp' 'CN=Corp Root, DC=corp') }
+Initialize-TlsHelper
+Assert-True 'sha256 hesap'            { [JenkinsAgentTls]::GetSha256([Text.Encoding]::ASCII.GetBytes('abc')) -eq $sha }
+Assert-True 'pin: hatasiz zincir'     { [JenkinsAgentTls]::IsPinnedChainValid($null, 'None', $sha) }
+Assert-True 'pin: ad uyusmazligi red' { -not [JenkinsAgentTls]::IsPinnedChainValid($null, 'RemoteCertificateNameMismatch', $sha) }
+Assert-True 'pin: zincir yok red'     { -not [JenkinsAgentTls]::IsPinnedChainValid($null, 'RemoteCertificateChainErrors', $sha) }
+Assert-True 'global callback yok'     { $null -eq [Net.ServicePointManager]::ServerCertificateValidationCallback }
+Assert-True 'http TLS kontrolu yok'   { $null -eq (Get-JenkinsTls 'http://jenkins.example.com/') }
+Assert-True 'http Windows modu'       { (Resolve-TrustMode -Probe $null -TrustStorePath 'C:\yok\truststore.p12').Mode -eq 'Windows' }
+Assert-True 'olmayan truststore bos'  { @(Get-TrustStoreThumbprint 'C:\yok\truststore.p12').Count -eq 0 }
+
+# Ana script: parse, BOM yok (irm | iex bozulur), sadece ASCII
+$scriptPath = Join-Path $PSScriptRoot '..\Install-JenkinsAgent.ps1'
+$scriptErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $scriptPath).ProviderPath, [ref]$null, [ref]$scriptErrors) | Out-Null
+$bytes = [IO.File]::ReadAllBytes((Resolve-Path $scriptPath).ProviderPath)
+Assert-True 'script parse hatasiz'    { $scriptErrors.Count -eq 0 }
+Assert-True 'script BOM yok'          { -not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) }
+Assert-True 'script sadece ASCII'     { @($bytes | Where-Object { $_ -gt 127 }).Count -eq 0 }
 
 Write-Host ''
 if ($script:Failed -gt 0) {
