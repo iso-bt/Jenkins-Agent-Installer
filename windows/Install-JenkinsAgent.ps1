@@ -195,6 +195,8 @@ using System.Security.Cryptography.X509Certificates;
 public class JenkinsAgentTlsProbe {
     public bool Trusted;
     public string PolicyErrors;
+    // Sabitlemenin cozemeyecegi zincir hatalari (suresi gecmis, imza gecersiz vb.); yoksa "NoError".
+    public string ChainProblems;
     public byte[] TopCertificate;
 }
 
@@ -216,11 +218,23 @@ public static class JenkinsAgentTls {
         }
     }
 
+    public static X509ChainStatusFlags GetChainProblems(X509Chain chain) {
+        X509ChainStatusFlags problems = X509ChainStatusFlags.NoError;
+        if (chain == null) return problems;
+        foreach (X509ChainElement element in chain.ChainElements) {
+            foreach (X509ChainStatus status in element.ChainElementStatus) {
+                problems |= status.Status & ~AllowedStatus;
+            }
+        }
+        return problems;
+    }
+
     // Normal Windows dogrulamasi; basarisizsa zincirin en ustundeki sertifika (varsa kok) saklanir.
     public static JenkinsAgentTlsProbe Probe(string url) {
         JenkinsAgentTlsProbe result = new JenkinsAgentTlsProbe();
         HttpWebRequest request = CreateRequest(url, delegate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
             result.PolicyErrors = errors.ToString();
+            result.ChainProblems = GetChainProblems(chain).ToString();
             if (chain != null && chain.ChainElements.Count > 0) {
                 result.TopCertificate = chain.ChainElements[chain.ChainElements.Count - 1].Certificate.RawData;
             } else if (cert != null) {
@@ -247,14 +261,11 @@ public static class JenkinsAgentTls {
     public static bool IsPinnedChainValid(X509Chain chain, SslPolicyErrors errors, string pinnedSha256) {
         if (errors == SslPolicyErrors.None) return true;
         if ((errors & ~SslPolicyErrors.RemoteCertificateChainErrors) != SslPolicyErrors.None || chain == null) return false;
-        bool found = false;
+        if (GetChainProblems(chain) != X509ChainStatusFlags.NoError) return false;
         foreach (X509ChainElement element in chain.ChainElements) {
-            foreach (X509ChainStatus status in element.ChainElementStatus) {
-                if ((status.Status & ~AllowedStatus) != X509ChainStatusFlags.NoError) return false;
-            }
-            if (GetSha256(element.Certificate.RawData) == pinnedSha256) found = true;
+            if (GetSha256(element.Certificate.RawData) == pinnedSha256) return true;
         }
-        return found;
+        return false;
     }
 
     // pinnedSha256 bossa sertifika hic dogrulanmaz (kullanici acikca secti). PowerShell $null'i "" olarak gecirir.
@@ -311,8 +322,26 @@ function Get-JenkinsTls([string] $Url) {
         Write-Ok 'Jenkins sertifikasi Windows tarafindan dogrulandi.'
     } else {
         Write-Warn "Jenkins sertifikasi Windows tarafindan dogrulanamadi ($($probe.PolicyErrors))."
+        $proxy = Get-SystemProxy $Url
+        if ($proxy) {
+            Write-Warn "Sistem proxy'si kullaniliyor ($proxy). Java bu proxy'yi kullanmaz; proxy TLS'e araya giriyorsa burada gorulen sertifika agent'in gorecegi sertifikadan farkli olabilir."
+        }
     }
     return $probe
+}
+
+function Get-SystemProxy([string] $Url) {
+    # Hedef icin kullanilan sistem proxy'si; dogrudan baglantida $null.
+    try {
+        $uri = [uri] $Url
+        $proxy = [Net.WebRequest]::DefaultWebProxy
+        if ((-not $proxy) -or $proxy.IsBypassed($uri)) { return $null }
+        $address = $proxy.GetProxy($uri)
+        if ((-not $address) -or ($address -eq $uri)) { return $null }
+        return $address.ToString()
+    } catch {
+        return $null
+    }
 }
 
 function Show-Certificate([byte[]] $Data) {
@@ -328,43 +357,70 @@ function Show-Certificate([byte[]] $Data) {
 
 function Resolve-TrustMode($Probe, [string] $TrustStorePath) {
     if ((-not $Probe) -or $Probe.Trusted) { return @{ Mode = 'Windows' } }
-    # -Force guven sorularina kendiliginden evet demesin; Confirm-Choice $Force'u bu kapsamdan okur.
-    $Force = $false
-    $insecure = @{ Mode = 'Insecure' }
-    $pinned = @{ Mode = 'Pinned'; Certificate = $Probe.TopCertificate }
-    $sha = [JenkinsAgentTls]::GetSha256($Probe.TopCertificate)
     if ($SkipCertificateCheck) {
         Write-Warn 'Sertifika kontrolu kapali (-SkipCertificateCheck).'
-        return $insecure
+        return @{ Mode = 'Insecure' }
     }
     if ($Probe.PolicyErrors -match 'NameMismatch') {
         throw 'Sertifikadaki ad Jenkins adresiyle eslesmiyor; sabitleme bunu cozmez. Dogru adresi kullanin veya -SkipCertificateCheck verin.'
     }
+    if (-not $Probe.TopCertificate) {
+        throw "Sunucu sertifikasi alinamadi ($($Probe.PolicyErrors)). Sertifika kontrolu kapatilacaksa -SkipCertificateCheck verin."
+    }
+    $problem = $null
+    if ($Probe.ChainProblems -and $Probe.ChainProblems -ne 'NoError') {
+        $problem = "Sertifika zinciri gecersiz ($($Probe.ChainProblems)); sabitlenemez. Suresi gecmis veya hatali sertifikayi Jenkins tarafinda yenileyin."
+    }
+    $sha = [JenkinsAgentTls]::GetSha256($Probe.TopCertificate)
+    $pinned = @{ Mode = 'Pinned'; Certificate = $Probe.TopCertificate }
     if ($TrustedCertThumbprint) {
+        if ($problem) { throw $problem }
         $expected = ConvertTo-Thumbprint $TrustedCertThumbprint
         if (-not $expected) { throw "Gecersiz -TrustedCertThumbprint: $TrustedCertThumbprint (64 haneli SHA-256 hex)." }
         if ($expected -ne $sha) { throw "Sunucu sertifikasi -TrustedCertThumbprint ile eslesmiyor (sunucu: $sha)." }
-        Write-Ok "Sertifika -TrustedCertThumbprint ile eslesti, sabitleniyor."
+        Write-Ok 'Sertifika -TrustedCertThumbprint ile eslesti, sabitleniyor.'
         return $pinned
     }
-    if ((Get-TrustStoreThumbprint $TrustStorePath) -contains $sha) {
+    if ((-not $problem) -and ((Get-TrustStoreThumbprint $TrustStorePath) -contains $sha)) {
         Write-Ok 'Ayni sertifika zaten sabitlenmis, mevcut truststore kullaniliyor.'
         return $pinned
     }
-    $hint = 'Sirket kok sertifikasini (root CA) Windows sertifika deposuna yukleyip tekrar calistirin.'
-    if ($NonInteractive) { throw "Jenkins sertifikasi dogrulanamadi. $hint Ya da -TrustedCertThumbprint $sha veya -SkipCertificateCheck verin." }
+    if ($NonInteractive) {
+        if ($problem) { throw "$problem Ya da -SkipCertificateCheck verin." }
+        throw "Jenkins sertifikasi dogrulanamadi. $(Get-RootCaHint) Ya da -TrustedCertThumbprint $sha veya -SkipCertificateCheck verin."
+    }
     Show-Certificate $Probe.TopCertificate
-    Write-Info '1) Sertifikayi sabitle (onerilen)'
+    if ($problem) { Write-Warn $problem }
+    return (Read-TrustChoice -Pinned $pinned -CanPin (-not $problem))
+}
+
+function Get-RootCaHint { return 'Sirket kok sertifikasini (root CA) Windows sertifika deposuna yukleyip tekrar calistirin.' }
+
+function Read-TrustChoice($Pinned, [bool] $CanPin) {
+    # -Force guven sorularina kendiliginden evet demesin; Confirm-Choice $Force'u bu kapsamdan okur.
+    $Force = $false
+    $default = '3'
+    if ($CanPin) {
+        Write-Info '1) Sertifikayi sabitle (onerilen)'
+        $default = '1'
+    }
     Write-Info '2) Sertifika kontrolunu kapat (guvensiz)'
     Write-Info '3) Iptal'
-    switch (Read-Value 'Secim' '1') {
-        '1' { if (Confirm-Choice 'Bu sertifikaya guvenilsin mi?' $false) { return $pinned } }
-        '2' {
-            Write-Warn 'UYARI: Sertifika kontrolu kapanirsa agda araya giren biri Jenkins gibi davranip secret''i ele gecirebilir ve agent''a is (kod) gonderebilir.'
-            if (Confirm-Choice 'Sertifika kontrolu yine de kapatilsin mi?' $false) { return $insecure }
+    while ($true) {
+        $choice = Read-Value 'Secim' $default
+        if ($choice -eq '1' -and $CanPin) {
+            if (Confirm-Choice 'Bu sertifikaya guvenilsin mi?' $false) { return $Pinned }
+            break
         }
+        if ($choice -eq '2') {
+            Write-Warn 'UYARI: Sertifika kontrolu kapanirsa agda araya giren biri Jenkins gibi davranip secret''i ele gecirebilir ve agent''a is (kod) gonderebilir.'
+            if (Confirm-Choice 'Sertifika kontrolu yine de kapatilsin mi?' $false) { return @{ Mode = 'Insecure' } }
+            break
+        }
+        if ($choice -eq '3') { break }
+        Write-Warn "Gecersiz secim: $choice"
     }
-    throw "Kurulum iptal edildi. $hint"
+    throw "Kurulum iptal edildi. $(Get-RootCaHint)"
 }
 
 function Set-TrustStore($Trust, [string] $JavaExe, [string] $Path, $Identity) {

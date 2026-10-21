@@ -140,6 +140,79 @@ Assert-True 'http TLS kontrolu yok'   { $null -eq (Get-JenkinsTls 'http://jenkin
 Assert-True 'http Windows modu'       { (Resolve-TrustMode -Probe $null -TrustStorePath 'C:\yok\truststore.p12').Mode -eq 'Windows' }
 Assert-True 'olmayan truststore bos'  { @(Get-TrustStoreThumbprint 'C:\yok\truststore.p12').Count -eq 0 }
 
+# Guven karari (sahte probe)
+$rsa = [Security.Cryptography.RSA]::Create(2048)
+$certRequest = New-Object Security.Cryptography.X509Certificates.CertificateRequest('CN=Test Root', $rsa, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+$testCert = $certRequest.CreateSelfSigned([DateTimeOffset]::Now.AddDays(-1), [DateTimeOffset]::Now.AddDays(1)).RawData
+$testSha = [JenkinsAgentTls]::GetSha256($testCert)
+function New-FakeProbe([string] $PolicyErrors = 'RemoteCertificateChainErrors', [string] $ChainProblems = 'NoError', $Certificate = $testCert) {
+    $probe = New-Object JenkinsAgentTlsProbe
+    $probe.PolicyErrors = $PolicyErrors
+    $probe.ChainProblems = $ChainProblems
+    $probe.TopCertificate = $Certificate
+    return $probe
+}
+function Invoke-Trust($Probe, [string[]] $Answers = @()) {
+    # Read-Host sirayla verilen cevaplari doner; sorulan soru sayisi $script:Asked'da.
+    $script:Answers = $Answers
+    $script:Asked = 0
+    try { return (Resolve-TrustMode -Probe $Probe -TrustStorePath 'C:\yok\truststore.p12' 6>$null).Mode }
+    catch { return 'THROW' }
+}
+function Read-Host { $answer = $script:Answers[$script:Asked]; $script:Asked++; return $answer }
+$untrusted = New-FakeProbe
+$expired = New-FakeProbe -ChainProblems 'NotTimeValid'
+
+$NonInteractive = $true; $Force = $true
+Assert-True 'NI+Force parametresiz red'   { (Invoke-Trust $untrusted) -eq 'THROW' }
+Assert-True 'NI+Force suresi gecmis red'  { (Invoke-Trust $expired) -eq 'THROW' }
+$TrustedCertThumbprint = $testSha.ToLowerInvariant()
+Assert-True 'NI thumbprint eslesir'       { (Invoke-Trust $untrusted) -eq 'Pinned' }
+Assert-True 'NI thumbprint suresi gecmis' { (Invoke-Trust $expired) -eq 'THROW' }
+$TrustedCertThumbprint = '0' * 64
+Assert-True 'NI thumbprint uyusmaz'       { (Invoke-Trust $untrusted) -eq 'THROW' }
+$TrustedCertThumbprint = $null
+Assert-True 'ad uyusmazligi red'          { (Invoke-Trust (New-FakeProbe -PolicyErrors 'RemoteCertificateNameMismatch')) -eq 'THROW' }
+Assert-True 'sertifika yok red'           { (Invoke-Trust (New-FakeProbe -PolicyErrors 'RemoteCertificateNotAvailable' -Certificate $null)) -eq 'THROW' }
+$SkipCertificateCheck = $true
+Assert-True 'sertifika yok + Skip'        { (Invoke-Trust (New-FakeProbe -PolicyErrors 'RemoteCertificateNotAvailable' -Certificate $null)) -eq 'Insecure' }
+$SkipCertificateCheck = $false
+Assert-True 'Windows guveniyor'           { (Resolve-TrustMode -Probe (New-Object JenkinsAgentTlsProbe -Property @{ Trusted = $true }) -TrustStorePath 'x' 6>$null).Mode -eq 'Windows' }
+
+$NonInteractive = $false
+Assert-True 'Force pin onayini vermez'    { (Invoke-Trust $untrusted @('1', '')) -eq 'THROW' }
+Assert-True 'Force bypass onayini vermez' { (Invoke-Trust $untrusted @('2', '')) -eq 'THROW' }
+$Force = $false
+Assert-True 'pin onayla'                  { (Invoke-Trust $untrusted @('1', 'e')) -eq 'Pinned' }
+Assert-True 'bypass onayla'               { (Invoke-Trust $untrusted @('2', 'e')) -eq 'Insecure' }
+Assert-True 'iptal'                       { (Invoke-Trust $untrusted @('3')) -eq 'THROW' }
+Assert-True 'gecersiz secim tekrar sorar' { ((Invoke-Trust $untrusted @('4', 'x', '1', 'e')) -eq 'Pinned') -and $script:Asked -eq 4 }
+Assert-True 'suresi gecmis pin sunulmaz'  { ((Invoke-Trust $expired @('1', '3')) -eq 'THROW') -and $script:Asked -eq 2 }
+Assert-True 'suresi gecmis varsayilan iptal' { (Invoke-Trust $expired @('')) -eq 'THROW' }
+Assert-True 'suresi gecmis bypass'        { (Invoke-Trust $expired @('2', 'e')) -eq 'Insecure' }
+Remove-Item function:Read-Host
+
+# Sistem proxy'si
+$prevProxy = [Net.WebRequest]::DefaultWebProxy
+[Net.WebRequest]::DefaultWebProxy = New-Object Net.WebProxy('http://proxy.local:8080', $false, [string[]] @('jenkins\.direct\.org'))
+Assert-True 'proxy tespit edilir'     { (Get-SystemProxy 'https://jenkins.example.com/') -eq 'http://proxy.local:8080/' }
+Assert-True 'proxy bypass listesi'    { $null -eq (Get-SystemProxy 'https://jenkins.direct.org/') }
+[Net.WebRequest]::DefaultWebProxy = $prevProxy
+
+# Mod degisince eski truststore silinir
+$storeDir = Join-Path $env:TEMP ('jat-' + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $storeDir | Out-Null
+try {
+    foreach ($mode in 'Windows', 'Insecure') {
+        $store = Join-Path $storeDir 'truststore.p12'
+        Set-Content -LiteralPath $store -Value 'eski'
+        Set-TrustStore -Trust @{ Mode = $mode } -JavaExe 'C:\yok\java.exe' -Path $store -Identity $null 6>$null
+        Assert-True "$mode modunda truststore silinir" { -not (Test-Path -LiteralPath $store) }
+    }
+} finally {
+    Remove-Item -LiteralPath $storeDir -Recurse -Force
+}
+
 # Ana script: parse, BOM yok (irm | iex bozulur), sadece ASCII
 $scriptPath = Join-Path $PSScriptRoot '..\Install-JenkinsAgent.ps1'
 $scriptErrors = $null
