@@ -431,6 +431,8 @@ if (-not (Test-Path -LiteralPath $JavaExe)) {
 Write-Log ("START '{0}' icin agent calismiyor, baslatiliyor: {1}" -f $AgentName, $JavaExe)
 
 $javaArgs = @(
+    # Kurum ici CA ile imzali Jenkins sertifikalari icin Java, Windows sertifika deposuna guvenir.
+    '-Djavax.net.ssl.trustStoreType=Windows-ROOT',
     '-jar', $AgentJar,
     '-url', $JenkinsUrl,
     '-secret', ('@' + $SecretFile),
