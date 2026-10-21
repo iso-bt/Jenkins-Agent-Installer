@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Jenkins inbound (webSocket) agent kurulumu - Windows.
 
